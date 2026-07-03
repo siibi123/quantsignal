@@ -11,6 +11,8 @@ import streamlit as st
 
 from quant.backtest import BTConfig, run_backtest, walk_forward
 from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
+from quant.options import (atm_term_structure, bs_greeks, build_surface,
+                           fetch_chains, skew_25)
 from quant.signals import BUY_TH, SELL_TH, atr, composite, latest_snapshot
 
 st.set_page_config(page_title="QuantSignal", page_icon="📈", layout="wide")
@@ -26,8 +28,9 @@ st.caption(
     "not predict future results.**"
 )
 
-tab_screener, tab_ticker, tab_backtest, tab_sizing = st.tabs(
-    ["🔍 Screener", "📊 Ticker analysis", "🧪 Backtest", "💰 Position size"]
+tab_screener, tab_ticker, tab_backtest, tab_sizing, tab_options = st.tabs(
+    ["🔍 Screener", "📊 Ticker analysis", "🧪 Backtest", "💰 Position size",
+     "🌋 Options / IV surface"]
 )
 
 SIGNAL_COLORS = {"BUY": "#0a8f5b", "SELL": "#c0392b", "HOLD": "#8a8a8a"}
@@ -233,3 +236,105 @@ with tab_sizing:
                 f"With a ${acct:,} account, position limits are what keep you in "
                 f"the game long enough for any edge to matter."
             )
+
+# ---------------------------------------------------------------------------
+# 5. Options / IV surface
+# ---------------------------------------------------------------------------
+with tab_options:
+    st.subheader("Implied volatility surface")
+    c1, c2 = st.columns([2, 1])
+    opt_tkr = c1.text_input("Ticker (must have listed options)", value="SPY",
+                            key="opt").upper().strip()
+    n_exp = c2.slider("Expiries to load", 3, 12, 8)
+
+    if st.button("Build surface", type="primary", key="optrun"):
+        with st.spinner(f"Downloading {n_exp} option chains for {opt_tkr}…"):
+            spot, chain = fetch_chains(opt_tkr, max_expiries=n_exp)
+
+        if chain.empty:
+            st.error(f"No usable options data for {opt_tkr}. Try SPY, QQQ, "
+                     "AAPL, NVDA or another liquid name.")
+        else:
+            ts = atm_term_structure(chain)
+            atm_iv = float(ts["iv"].iloc[0]) if len(ts) else None
+            skew = skew_25(chain)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Spot", f"${spot:,.2f}")
+            m2.metric("ATM IV (near expiry)",
+                      f"{atm_iv:.1f}%" if atm_iv else "—")
+            m3.metric("Skew (95P − 105C)",
+                      f"{skew:+.1f} pts" if skew is not None else "—",
+                      help="Positive = puts richer than calls (crash fear)")
+            m4.metric("Quotes used", f"{len(chain):,}")
+
+            # ---- 3D surface ------------------------------------------------
+            strikes, dtes, grid = build_surface(chain)
+            if grid.size:
+                fig = go.Figure(data=[go.Surface(
+                    x=strikes, y=dtes, z=grid,
+                    colorscale="Jet", colorbar=dict(title="IV %"),
+                    connectgaps=True,
+                )])
+                fig.update_layout(
+                    height=620,
+                    scene=dict(
+                        xaxis_title="Strike",
+                        yaxis_title="Days to expiry",
+                        zaxis_title="Implied vol (%)",
+                        camera=dict(eye=dict(x=-1.6, y=-1.6, z=0.7)),
+                    ),
+                    margin=dict(l=0, r=0, t=30, b=0),
+                    title=f"{opt_tkr} IV surface — spot ${spot:,.2f}",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    "OTM quotes only (puts below spot, calls above), median "
+                    "IV per strike, interpolated. Drag to rotate, scroll to zoom."
+                )
+
+            # ---- Smile + term structure ------------------------------------
+            colA, colB = st.columns(2)
+            with colA:
+                exps = sorted(chain["expiry"].unique())
+                pick = st.selectbox("Smile for expiry", exps, index=0)
+                sm = chain[chain["expiry"] == pick]
+                figs = go.Figure()
+                for side, color in (("P", "#c0392b"), ("C", "#0a8f5b")):
+                    s = sm[sm["type"] == side].groupby("strike")["iv"].median()
+                    figs.add_trace(go.Scatter(x=s.index, y=s.values,
+                                              mode="lines+markers",
+                                              name="Puts" if side == "P" else "Calls",
+                                              line=dict(color=color)))
+                figs.add_vline(x=spot, line_dash="dot", annotation_text="spot")
+                figs.update_layout(height=360, xaxis_title="Strike",
+                                   yaxis_title="IV %",
+                                   margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(figs, use_container_width=True)
+            with colB:
+                st.markdown("**ATM term structure**")
+                figt = go.Figure(go.Scatter(x=ts["dte"], y=ts["iv"],
+                                            mode="lines+markers"))
+                figt.update_layout(height=360, xaxis_title="Days to expiry",
+                                   yaxis_title="ATM IV %",
+                                   margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(figt, use_container_width=True)
+                st.caption("Upward slope = calm market pricing future risk; "
+                           "inverted = near-term event fear.")
+
+            # ---- Chain with Greeks -----------------------------------------
+            st.markdown("#### Option chain + Greeks (selected expiry)")
+            sel = chain[chain["expiry"] == pick].copy()
+            g = bs_greeks(spot, sel["strike"].values,
+                          sel["dte"].values / 365.0,
+                          sel["iv"].values / 100.0,
+                          (sel["type"] == "C").values)
+            sel = pd.concat([sel.reset_index(drop=True), g], axis=1)
+            show_cols = ["type", "strike", "last", "bid", "ask", "iv",
+                         "volume", "oi", "delta", "gamma", "vega", "theta"]
+            st.dataframe(
+                sel[show_cols].sort_values(["type", "strike"]),
+                use_container_width=True, height=380,
+            )
+            st.caption("Greeks are Black-Scholes estimates from quoted IV; "
+                       "data is delayed ~15 min (Yahoo). Educational, not advice.")
