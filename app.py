@@ -17,6 +17,8 @@ from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
 from quant.flow import gex_profile, gex_summary, unusual_flow
 from quant.seasonality import fundamental_snapshot, monthly_seasonality
 from quant.levels import fib_levels, hurst
+from quant.journal import (journal_from_csv, journal_to_csv, load_journal,
+                           mark_to_market, record_plan, save_journal)
 from quant.montecarlo import cone, simulate, trade_odds
 from quant.rl_lab import (MDM_COLORS, MDM_STYLES, market_dynamics,
                           prudex_scores, train_agent)
@@ -153,10 +155,10 @@ PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
                      plot_bgcolor="rgba(0,0,0,0)",
                      font=dict(family="Inter", color="#e6edf3"))
 
-(tab_master, tab_desk, tab_screener, tab_backtest, tab_options, tab_rl,
- tab_sizing) = st.tabs(
-    ["🧬 Alpha engine", "🎯 Trade desk", "🔍 Screener", "🧪 Backtest",
-     "🌋 Options / IV surface", "🤖 RL lab", "💰 Position size"]
+(tab_master, tab_journal, tab_desk, tab_screener, tab_backtest, tab_options,
+ tab_rl, tab_sizing) = st.tabs(
+    ["🧬 Alpha engine", "📒 Track record", "🎯 Trade desk", "🔍 Screener",
+     "🧪 Backtest", "🌋 Options / IV surface", "🤖 RL lab", "💰 Position size"]
 )
 
 SIGNAL_COLORS = {"BUY": "#10b981", "SELL": "#ef4444", "HOLD": "#8a8a8a"}
@@ -196,7 +198,11 @@ with tab_master:
                          risk_pct=ma_risk, max_positions=ma_maxpos)
         prog.progress(100, text="Done")
         prog.empty()
+        st.session_state["master_res"] = res
+        st.session_state["master_acct"] = float(ma_acct)
 
+    if "master_res" in st.session_state:
+        res = st.session_state["master_res"]
         if "error" in res:
             st.error(res["error"])
             st.stop()
@@ -225,6 +231,19 @@ with tab_master:
             st.info("**The machine says: do nothing.** No candidate passed all "
                     "four gates (anomaly rank → verdict → regime → risk). "
                     "Cash is a position; the next setup will come to you.")
+
+        if len(res["plan"]):
+            if st.button("📒 Record this plan to the track record",
+                         key="rec_plan"):
+                jj = load_journal()
+                jj, n_added = record_plan(jj, res["plan"],
+                                          res["regime"]["regime"],
+                                          st.session_state.get("master_acct",
+                                                               5000.0))
+                save_journal(jj)
+                st.success(f"Recorded {n_added} position(s) with UTC "
+                           f"timestamp, model version and regime stamp. "
+                           f"See the 📒 Track record tab.")
 
         st.warning(f"**Honesty layer (McLean & Pontiff 2016):** published "
                    f"anomalies earn ~{res['haircut_pct']}% LESS after "
@@ -269,6 +288,92 @@ with tab_master:
             st.caption("Good anomaly scores, bad timing — the whole point of "
                        "layering time-series checks on top of cross-sectional "
                        "ranks.")
+
+
+# ===========================================================================
+# 0b. TRACK RECORD — the fund fact sheet
+# ===========================================================================
+with tab_journal:
+    st.subheader("📒 Track record — verified paper-trading journal")
+    st.caption("Append-only journal: every plan stamped with UTC time, model "
+               "version and market regime at entry. Stops & targets enforced "
+               "mechanically on real daily bars (first touch; stop wins ties). "
+               "This is how a strategy earns trust before real money.")
+
+    jj = load_journal()
+    n_pos = len(jj["positions"])
+
+    ctop = st.columns([1, 1, 2])
+    if n_pos:
+        ctop[0].download_button("⬇️ Export journal (CSV)",
+                                journal_to_csv(jj), "quantsignal_journal.csv",
+                                "text/csv")
+    up = ctop[1].file_uploader("Restore from CSV", type="csv",
+                               label_visibility="collapsed")
+    if up is not None:
+        jj = journal_from_csv(up.getvalue().decode())
+        save_journal(jj)
+        st.success(f"Journal restored — {len(jj['positions'])} positions.")
+        n_pos = len(jj["positions"])
+    ctop[2].info("⚠️ Free hosting wipes local files on redeploy — export "
+                 "after every session. The CSV is your custody.")
+
+    if not n_pos:
+        st.info("No positions recorded yet. Run the 🧬 Alpha engine and hit "
+                "**Record this plan** — the clock starts there.")
+    else:
+        with st.spinner("Marking positions to market…"):
+            mtm = mark_to_market(jj, lambda t: fetch_history(t, period="1y"))
+            save_journal(jj)   # persist any auto-closed stops/targets
+
+        if mtm.get("data_issues"):
+            st.warning("Data issues: " + ", ".join(mtm["data_issues"]))
+
+        s = mtm["stats"]
+        head = st.columns(6)
+        head[0].metric("Paper equity", f"${s.get('Equity $', 0):,.0f}")
+        head[1].metric("Total return", f"{s.get('Total return %', 0)}%")
+        head[2].metric("vs SPY", f"{s.get('Alpha vs SPY %', '—')}%"
+                       if "Alpha vs SPY %" in s else "—")
+        head[3].metric("Live Sharpe", s.get("Sharpe (live)", "—"))
+        head[4].metric("Hit rate", f"{s.get('Hit rate %', '—')}%"
+                       if "Hit rate %" in s else "—")
+        head[5].metric("Open heat", f"${s.get('Heat (risk if all stops hit) $', 0):,.0f}")
+
+        meta1, meta2, meta3 = st.columns(3)
+        meta1.caption(f"Inception: {jj['meta'].get('inception', '—')}")
+        meta2.caption(f"Model: {jj['meta'].get('version', '—')}")
+        meta3.caption(f"Positions: {s.get('Open / Closed', '—')} "
+                      f"(open/closed) · Max DD {s.get('Max DD %', '—')}%")
+
+        if len(mtm["equity"]) > 1:
+            fige = go.Figure()
+            fige.add_trace(go.Scatter(x=mtm["equity"].index, y=mtm["equity"],
+                                      name="Portfolio",
+                                      line=dict(color="#10b981", width=2)))
+            if len(mtm["bench"]) > 1:
+                fige.add_trace(go.Scatter(x=mtm["bench"].index, y=mtm["bench"],
+                                          name="SPY (same $)",
+                                          line=dict(color="#8b98a5", width=1.5,
+                                                    dash="dot")))
+            fige.update_layout(height=380, yaxis_title="Equity $",
+                               margin=dict(l=10, r=10, t=30, b=10),
+                               **PLOTLY_LAYOUT)
+            st.plotly_chart(fige, use_container_width=True)
+
+        st.markdown("#### Blotter")
+        st.dataframe(mtm["blotter"], use_container_width=True,
+                     hide_index=True, height=360)
+
+        if len(mtm["monthly"]):
+            st.markdown("#### Monthly returns")
+            st.dataframe(mtm["monthly"], use_container_width=True,
+                         hide_index=True)
+
+        with st.expander("❓ Why this is the feature that matters most"):
+            st.markdown("""
+Backtests can be (accidentally) curve-fit. A **forward paper record** cannot: the timestamps prove every pick was made *before* the outcome. This is exactly how allocators evaluate new managers — months of verified process before a dollar moves. Rules of the game: record every plan (no cherry-picking), let stops do their job, export the CSV after each session, and judge nothing before ~20 closed trades. If after months the record shows an edge over SPY — it's real. If it doesn't — the site just saved you real money.
+""")
 
 # ===========================================================================
 # 1. TRADE DESK
