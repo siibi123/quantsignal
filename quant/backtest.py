@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from .bxtrender import bxtrender
 from .signals import atr, composite, rsi, sma
 
 
@@ -31,7 +32,9 @@ class BTConfig:
     commission_pct: float = 0.001
     atr_stop_mult: float = 2.5
     risk_per_trade: float = 0.01
-    mode: str = "auto"              # "auto" | "trend" | "dip"
+    mode: str = "auto"              # "auto" | "trend" | "dip" | "core"
+    allow_short: bool = False       # trend mode: short below SMA200
+    fib_filter: bool = True         # dip mode: only buy inside 0.382-0.786 zone
     breakeven_r: float = 1.0        # move stop to entry after +1R
     time_stop_trend: int = 20       # bars; exit if unprofitable by then
     time_stop_dip: int = 10
@@ -95,18 +98,25 @@ def run_backtest(df: pd.DataFrame, cfg: BTConfig = BTConfig()) -> BTResult:
         mode = "trend" if h >= 0.5 else "dip"
 
     comp = composite(df) if mode == "trend" else None
+    bx = bxtrender(df)
     a = atr(df)
     s200 = sma(df["Close"], 200)
     r2 = rsi(df["Close"], 2)
 
-    # volatility-target scaler: current ATR% vs its 1y median
+    # Fibonacci retracement zone of the rolling 126-bar swing (for dip mode):
+    roll_hi = df["High"].rolling(126, min_periods=40).max()
+    roll_lo = df["Low"].rolling(126, min_periods=40).min()
+    rng_ = roll_hi - roll_lo
+    fib_lo = roll_hi - 0.786 * rng_          # deep edge of the pocket
+    fib_hi = roll_hi - 0.382 * rng_          # shallow edge
+
     atr_pct = (a / df["Close"])
     med = atr_pct.rolling(252, min_periods=60).median()
     vt = (med / atr_pct).clip(0.5, 1.5).fillna(1.0) if cfg.vol_target else \
         pd.Series(1.0, index=df.index)
 
     cash = cfg.starting_cash
-    shares = 0.0
+    shares = 0.0                      # negative = short
     entry_price = stop = 0.0
     entry_i = 0
     be_armed = False
@@ -114,72 +124,132 @@ def run_backtest(df: pd.DataFrame, cfg: BTConfig = BTConfig()) -> BTResult:
 
     o_, h_, l_, c_ = (df[k].values for k in ("Open", "High", "Low", "Close"))
     sig = comp["signal"].values if comp is not None else None
+    bx_long = bx["long_osc"].values
+    bx_rising = bx["t3_rising"].values
+    bx_buyturn = bx["buy_turn"].values
     idx = df.index
     time_stop = cfg.time_stop_trend if mode == "trend" else cfg.time_stop_dip
+
+    def close_pos(i, exit_px, reason):
+        nonlocal cash, shares, be_armed
+        exit_px = max(exit_px, 0.01)
+        if shares > 0:
+            proceeds = shares * exit_px * (1 - cfg.commission_pct)
+            pnl = proceeds - shares * entry_price * (1 + cfg.commission_pct)
+            cash += proceeds
+        else:  # short cover
+            qty = -shares
+            cost = qty * exit_px * (1 + cfg.commission_pct)
+            pnl = qty * entry_price * (1 - cfg.commission_pct) - cost
+            cash += qty * entry_price * (1 - cfg.commission_pct) - cost + qty * entry_price * 0  # margin release handled via cash below
+            cash = cash  # cash already holds short proceeds at entry
+        trade_rows.append({"entry_date": idx[entry_i], "exit_date": idx[i],
+                           "side": "LONG" if shares > 0 else "SHORT",
+                           "entry": round(entry_price, 2),
+                           "exit": round(exit_px, 2),
+                           "pnl": round(pnl, 2), "reason": reason})
+        shares = 0.0
+        be_armed = False
 
     for i in range(1, len(df)):
         o, hi, lo, c = o_[i], h_[i], l_[i], c_[i]
         prev_atr = a.values[i - 1]
-        above200 = c_[i - 1] > s200.values[i - 1] if not np.isnan(s200.values[i - 1]) else False
+        s200_ok = not np.isnan(s200.values[i - 1])
+        above200 = s200_ok and c_[i - 1] > s200.values[i - 1]
+        below200 = s200_ok and c_[i - 1] < s200.values[i - 1]
 
-        # ---------------- exits ----------------
-        if shares > 0:
+        # ================= CORE mode: improved buy & hold =================
+        if mode == "core":
+            in_market = shares > 0
+            healthy = above200 and bx_long[i - 1] > 0
+            if in_market and not healthy:
+                close_pos(i, o, "regime exit")
+            elif (not in_market) and healthy:
+                shares = float((cash * 0.98) / (o * (1 + cfg.commission_pct)))
+                if shares * o >= 100:
+                    cash -= shares * o * (1 + cfg.commission_pct)
+                    entry_price, entry_i = o, i
+                else:
+                    shares = 0.0
+            equity_rows.append(cash + shares * c)
+            continue
+
+        # ================= exits (trend / dip) =================
+        if shares != 0:
             bars_in = i - entry_i
             r_dist = cfg.atr_stop_mult * a.values[entry_i - 1]
+            long_pos = shares > 0
 
-            # breakeven arming
-            if not be_armed and hi >= entry_price + cfg.breakeven_r * r_dist:
-                stop = max(stop, entry_price)
-                be_armed = True
-            # chandelier trail (trend only)
-            if mode == "trend":
-                stop = max(stop, hi - cfg.atr_stop_mult * prev_atr)
+            if long_pos:
+                if not be_armed and hi >= entry_price + cfg.breakeven_r * r_dist:
+                    stop = max(stop, entry_price); be_armed = True
+                if mode == "trend":
+                    stop = max(stop, hi - cfg.atr_stop_mult * prev_atr)
+                hit = lo <= stop
+            else:
+                if not be_armed and lo <= entry_price - cfg.breakeven_r * r_dist:
+                    stop = min(stop, entry_price); be_armed = True
+                if mode == "trend":
+                    stop = min(stop, lo + cfg.atr_stop_mult * prev_atr)
+                hit = hi >= stop
 
-            exit_now, reason, exit_px = False, "", o
-            if lo <= stop:
-                exit_now, reason = True, "breakeven" if be_armed and stop <= entry_price * 1.001 else "stop"
-                exit_px = min(o, stop) if o > stop else o
-            elif mode == "trend" and sig[i - 1] == "SELL":
+            exit_now, reason = False, ""
+            if hit:
+                exit_now, reason = True, "breakeven" if be_armed else "stop"
+            elif mode == "trend" and long_pos and sig[i - 1] == "SELL":
                 exit_now, reason = True, "signal"
-            elif mode == "dip" and r2.values[i - 1] > 65:
+            elif mode == "trend" and not long_pos and sig[i - 1] == "BUY":
+                exit_now, reason = True, "signal"
+            elif mode == "dip" and long_pos and r2.values[i - 1] > 65:
                 exit_now, reason = True, "target(rsi)"
-            elif bars_in >= time_stop and c_[i - 1] < entry_price:
+            elif bars_in >= time_stop and (
+                    (long_pos and c_[i - 1] < entry_price) or
+                    (not long_pos and c_[i - 1] > entry_price)):
                 exit_now, reason = True, "time"
 
             if exit_now:
-                exit_px = max(exit_px, 0.01)
-                proceeds = shares * exit_px * (1 - cfg.commission_pct)
-                pnl = proceeds - shares * entry_price * (1 + cfg.commission_pct)
-                trade_rows.append({"entry_date": idx[entry_i], "exit_date": idx[i],
-                                   "entry": round(entry_price, 2),
-                                   "exit": round(exit_px, 2),
-                                   "pnl": round(pnl, 2), "reason": reason})
-                cash += proceeds
-                shares = 0.0
-                be_armed = False
+                px = o
+                if hit:
+                    px = min(o, stop) if long_pos and o > stop else \
+                         max(o, stop) if (not long_pos) and o < stop else o
+                close_pos(i, px, reason)
 
-        # ---------------- entries ----------------
+        # ================= entries =================
         if shares == 0 and prev_atr > 0:
-            gate = above200 if cfg.regime_filter else True
-            enter = False
+            stop_dist = cfg.atr_stop_mult * prev_atr
+            risk_dollars = cash * cfg.risk_per_trade * vt.values[i - 1]
+            size = min(risk_dollars / stop_dist,
+                       cash / (o * (1 + cfg.commission_pct)))
+
+            go_long = go_short = False
             if mode == "trend":
-                enter = gate and sig[i - 1] == "BUY"
+                # B-Xtrender confirmation: long osc positive & T3 rising
+                go_long = (above200 or not cfg.regime_filter) and \
+                          sig[i - 1] == "BUY" and \
+                          bx_long[i - 1] > 0 and bx_rising[i - 1]
+                if cfg.allow_short:
+                    go_short = below200 and sig[i - 1] == "SELL" and \
+                               bx_long[i - 1] < 0 and not bx_rising[i - 1]
             else:  # dip
-                enter = gate and r2.values[i - 1] < 10
-            if enter:
-                stop_dist = cfg.atr_stop_mult * prev_atr
-                risk_dollars = cash * cfg.risk_per_trade * vt.values[i - 1]
-                size_by_risk = risk_dollars / stop_dist
-                max_by_cash = cash / (o * (1 + cfg.commission_pct))
-                shares = float(min(size_by_risk, max_by_cash))
-                if shares * o < 100:
-                    shares = 0.0
-                else:
-                    cash -= shares * o * (1 + cfg.commission_pct)
-                    entry_price = o
-                    entry_i = i
-                    stop = o - stop_dist
-                    be_armed = False
+                in_pocket = True
+                if cfg.fib_filter and not np.isnan(fib_lo.values[i - 1]):
+                    in_pocket = fib_lo.values[i - 1] <= c_[i - 1] <= fib_hi.values[i - 1]
+                go_long = (above200 or not cfg.regime_filter) and \
+                          r2.values[i - 1] < 10 and \
+                          (in_pocket or bx_buyturn[i - 1])
+
+            if go_long and size * o >= 100:
+                shares = float(size)
+                cash -= shares * o * (1 + cfg.commission_pct)
+                entry_price, entry_i = o, i
+                stop = o - stop_dist
+                be_armed = False
+            elif go_short and size * o >= 100:
+                shares = -float(size)
+                cash += size * o * (1 - cfg.commission_pct)   # short proceeds
+                entry_price, entry_i = o, i
+                stop = o + stop_dist
+                be_armed = False
 
         equity_rows.append(cash + shares * c)
 

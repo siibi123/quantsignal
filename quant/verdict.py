@@ -19,7 +19,8 @@ MODELS = ["trend", "momentum", "bxtrender", "macd", "rsi", "meanrev", "volume"]
 
 
 def analyze(df: pd.DataFrame, account: float = 5000.0,
-            risk_pct: float = 1.0, skew: float | None = None) -> dict:
+            risk_pct: float = 1.0, skew: float | None = None,
+            flow_call_share: float | None = None) -> dict:
     """Full desk-style analysis of one ticker. Returns a verdict dict."""
     comp = composite(df)
     last = comp.iloc[-1]
@@ -76,13 +77,23 @@ def analyze(df: pd.DataFrame, account: float = 5000.0,
         elif direction == 1 and skew < 2:
             skew_adj = +3.0
 
+    # --- 4b. Unusual-flow tilt (live options positioning) ---------------------
+    flow_adj = 0.0
+    if flow_call_share is not None:
+        if direction == 1 and flow_call_share >= 0.65:
+            flow_adj = +5.0
+        elif direction == 1 and flow_call_share <= 0.35:
+            flow_adj = -5.0
+        elif direction == -1 and flow_call_share <= 0.35:
+            flow_adj = +5.0
+
     # --- 5. Conviction (0-100) ----------------------------------------------
     conviction = 100 * (
         0.40 * min(abs(score) / 0.50, 1.0)      # signal strength
         + 0.25 * agree_frac                     # model agreement
         + 0.15 * regime                         # calm regime
         + 0.20 * min(max(sharpe, 0) / 1.2, 1.0) # proven edge here
-    ) + skew_adj
+    ) + skew_adj + flow_adj
     conviction = float(np.clip(conviction, 0, 100))
 
     # --- 6. Verdict ----------------------------------------------------------
@@ -123,6 +134,10 @@ def analyze(df: pd.DataFrame, account: float = 5000.0,
     else:
         reasons_con.append(f"Poor risk/reward {rr}:1 — target too close to stop")
 
+    if flow_call_share is not None and abs(flow_adj) > 0:
+        (reasons_pro if flow_adj > 0 else reasons_con).append(
+            f"Unusual options flow: {flow_call_share*100:.0f}% of fresh premium "
+            f"in calls ({flow_adj:+.0f} conviction)")
     if skew is not None and abs(skew_adj) > 0:
         (reasons_pro if skew_adj > 0 else reasons_con).append(
             f"Options skew {skew:+.1f} pts adjusts conviction {skew_adj:+.0f}")

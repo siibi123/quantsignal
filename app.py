@@ -284,13 +284,20 @@ with tab_desk:
                 st.error(f"Not enough data for {tkr} (need ~1y of history).")
                 st.stop()
             skew = None
+            flow_share = None
             if use_opts:
                 try:
                     _, chain_d = fetch_chains(tkr, max_expiries=4)
                     skew = skew_25(chain_d)
+                    uf_d = unusual_flow(chain_d, top_n=30)
+                    if len(uf_d):
+                        callp = uf_d.loc[uf_d["type"] == "C", "premium_$"].sum()
+                        totp = uf_d["premium_$"].sum()
+                        flow_share = float(callp / totp) if totp > 0 else None
                 except Exception:
                     skew = None
-            v = analyze(df, account=account, risk_pct=risk_pct, skew=skew)
+            v = analyze(df, account=account, risk_pct=risk_pct, skew=skew,
+                        flow_call_share=flow_share)
             h = hurst(df)
             fib = fib_levels(df)
             reg = regime_quadrant(df)
@@ -736,8 +743,10 @@ with tab_backtest:
     bt_cash = c3.number_input("Starting cash $", 500, 1_000_000, 5000,
                               step=500)
     bt_risk = c4.slider("Risk per trade %", 0.5, 5.0, 1.0, 0.5)
-    bt_mode = c5.selectbox("Engine", ["auto", "trend", "dip"], index=0,
+    bt_mode = c5.selectbox("Engine", ["auto", "core", "trend", "dip"], index=0,
                            help="auto picks per ticker by Hurst exponent")
+    bt_short = st.checkbox("Allow shorts (trend mode, below 200-SMA only)",
+                           value=False, key="bt_short")
 
     if st.button("Run backtest", type="primary", key="btrun"):
         df = fetch_history(bt_tkr, period=bt_period)
@@ -745,7 +754,8 @@ with tab_backtest:
             st.error("Not enough history — need at least ~1 year.")
         else:
             cfg = BTConfig(starting_cash=float(bt_cash),
-                           risk_per_trade=bt_risk / 100, mode=bt_mode)
+                           risk_per_trade=bt_risk / 100, mode=bt_mode,
+                           allow_short=bt_short)
             res = run_backtest(df, cfg)
             st.caption(f"Engine used: **{res.mode_used.upper()}** "
                        f"{'(picked automatically by Hurst)' if bt_mode == 'auto' else ''}")
@@ -753,11 +763,22 @@ with tab_backtest:
             for col, (k, val) in zip(cols * 2, res.metrics.items()):
                 col.metric(k, val if val is not None else "—")
 
+            with st.expander("📉 Why is my Sharpe low? (read this once)"):
+                st.markdown("""
+Three usual suspects, in order of impact:
+1. **Cash drag** — risking 1%/trade with a 2.5×ATR stop deploys only ~15-25% of capital; the rest earns nothing while buy & hold is 100% invested. **Fix: the CORE engine** — near-fully invested while the regime is healthy (above 200-SMA + B-Xtrender positive), cash when it breaks. B&H-like CAGR in bulls, a fraction of the drawdown in bears.
+2. **Single-name concentration** — one stock's noise dominates. Sharpe rises with diversification faster than with better signals; that's what the 🧬 Alpha engine's multi-position plan is for.
+3. **Trend systems are streaky** — 40% win rates with occasional big winners produce lumpy equity. The DIP engine smooths it (77%+ win rate, small wins). A **blend** of core + dip is how small systematic accounts actually maximize Sharpe.
+""")
+
             with st.expander("⚙️ What's inside the v2 engine?"):
                 st.markdown("""
 Two strategies, auto-selected per ticker by its **Hurst exponent**:
 - **TREND** — follows the 7-model composite signal. For tickers whose moves *continue* (H > 0.5).
-- **DIP** — Connors-style RSI(2) pullback buyer: buys short-term panic **inside an uptrend**, exits on the snap-back or a strict time limit. For choppier, mean-reverting names — historically one of the highest win-rate setups in the literature (65–78%).
+- **DIP** — Connors-style RSI(2) pullback buyer: buys short-term panic **inside an uptrend**, exits on the snap-back or a strict time limit — now with a **Fibonacci pocket filter**: panic is only bought when price sits inside the 0.382–0.786 retracement zone of the dominant swing (or on a B-Xtrender buy-turn). Confluence, not just oversold.
+- **CORE** — improved buy & hold: ~fully invested while price > 200-SMA **and** the B-Xtrender long oscillator is positive; steps to cash when either breaks. Fixes the cash-drag problem that makes signal strategies lose to B&H in bull markets.
+- **Shorts (optional)** — trend mode can short below the 200-SMA when the composite says SELL and B-Xtrender confirms (falling & negative). Symmetric stops, breakeven and time exits.
+- **B-Xtrender confirmation** — trend longs now require the long oscillator positive AND the T3 rising. Fewer, better entries.
 
 Risk mechanics on every trade:
 - **Regime gate (Faber 2007)** — longs only above the 200-day SMA. No knife-catching.
