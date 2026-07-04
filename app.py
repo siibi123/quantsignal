@@ -18,6 +18,8 @@ from quant.flow import gex_profile, gex_summary, unusual_flow
 from quant.seasonality import fundamental_snapshot, monthly_seasonality
 from quant.levels import fib_levels, hurst
 from quant.montecarlo import cone, simulate, trade_odds
+from quant.rl_lab import (MDM_COLORS, MDM_STYLES, market_dynamics,
+                          prudex_scores, train_agent)
 from quant.options import (atm_term_structure, bs_greeks, build_surface,
                            fetch_chains, max_pain, put_call_ratio, skew_25)
 from quant.signals import BUY_TH, SELL_TH, atr, composite, latest_snapshot
@@ -151,9 +153,10 @@ PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
                      plot_bgcolor="rgba(0,0,0,0)",
                      font=dict(family="Inter", color="#e6edf3"))
 
-tab_master, tab_desk, tab_screener, tab_backtest, tab_options, tab_sizing = st.tabs(
+(tab_master, tab_desk, tab_screener, tab_backtest, tab_options, tab_rl,
+ tab_sizing) = st.tabs(
     ["🧬 Alpha engine", "🎯 Trade desk", "🔍 Screener", "🧪 Backtest",
-     "🌋 Options / IV surface", "💰 Position size"]
+     "🌋 Options / IV surface", "🤖 RL lab", "💰 Position size"]
 )
 
 SIGNAL_COLORS = {"BUY": "#10b981", "SELL": "#ef4444", "HOLD": "#8a8a8a"}
@@ -1043,6 +1046,115 @@ Every point = one option's implied vol (strike × expiry). Pros look for: the **
 - **Theta** — $ lost per day to time decay; the rent you pay to hold.
 
 Data ~15 min delayed (Yahoo). Educational, not advice.
+""")
+
+
+# ===========================================================================
+# 6. RL LAB — TradeMaster-inspired
+# ===========================================================================
+with tab_rl:
+    st.subheader("🤖 RL lab — a learning agent, evaluated honestly")
+    st.caption("Inspired by TradeMaster (NTU, NeurIPS 2023): agent + market "
+               "dynamics modeling + PRUDEX-style multi-axis evaluation. "
+               "Trained on the first 70% of history, judged ONLY on the "
+               "unseen last 30%.")
+    c1, c2 = st.columns([2, 1])
+    rl_tkr = c1.text_input("Ticker", value="AAPL", key="rl").upper().strip()
+    rl_period = c2.selectbox("History", ["5y", "10y"], index=0, key="rlp")
+
+    if st.button("Train & evaluate agent", type="primary", key="rlrun"):
+        with st.spinner("Training agent on the first 70%, testing on the rest…"):
+            df = fetch_history(rl_tkr, period=rl_period)
+            if len(df) < 400:
+                st.error("Need at least ~400 bars of history.")
+                st.stop()
+            res = train_agent(df)
+            if "error" in res:
+                st.error(res["error"])
+                st.stop()
+            md = market_dynamics(df)
+
+        # --- current decision ------------------------------------------------
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Current market state", res["current_state"])
+        act_color = "🟢" if res["current_action"] == "LONG" else "⚪"
+        d2.metric("Agent says", f"{act_color} {res['current_action']}")
+        d3.metric("Edge estimate (bps/day)", res["current_confidence"])
+        d4.metric("OOS exposure", f"{res['oos_exposure_pct']}%")
+
+        # --- OOS equity ------------------------------------------------------
+        st.markdown(f"### Out-of-sample test (from {res['split_date']} — "
+                    "data the agent never saw)")
+        figr = go.Figure()
+        figr.add_trace(go.Scatter(x=res["oos_equity"].index,
+                                  y=res["oos_equity"], name="Agent",
+                                  line=dict(color="#10b981", width=2)))
+        figr.add_trace(go.Scatter(x=res["oos_bh"].index, y=res["oos_bh"],
+                                  name="Buy & Hold",
+                                  line=dict(color="#8b98a5", width=1.5,
+                                            dash="dot")))
+        figr.update_layout(height=380, yaxis_title="Growth of $1",
+                           margin=dict(l=10, r=10, t=30, b=10),
+                           **PLOTLY_LAYOUT)
+        st.plotly_chart(figr, use_container_width=True)
+
+        s1, s2 = st.columns(2)
+        with s1:
+            st.markdown("**Agent (out-of-sample)**")
+            st.json(res["oos_stats"])
+        with s2:
+            st.markdown("**Buy & Hold (same period)**")
+            st.json(res["bh_stats"])
+
+        # --- PRUDEX radar -----------------------------------------------------
+        st.markdown("### 🧭 PRUDEX-style evaluation compass")
+        ax_a = prudex_scores(res["oos_equity"],
+                             exposure_pct=res["oos_exposure_pct"])
+        ax_b = prudex_scores(res["oos_bh"], exposure_pct=100)
+        cats = list(ax_a.keys())
+        figc = go.Figure()
+        figc.add_trace(go.Scatterpolar(r=[ax_a[k] for k in cats] + [ax_a[cats[0]]],
+                                       theta=cats + [cats[0]], fill="toself",
+                                       name="Agent",
+                                       line=dict(color="#10b981")))
+        figc.add_trace(go.Scatterpolar(r=[ax_b[k] for k in cats] + [ax_b[cats[0]]],
+                                       theta=cats + [cats[0]], fill="toself",
+                                       name="Buy & Hold",
+                                       line=dict(color="#8b98a5")))
+        figc.update_layout(height=420, polar=dict(radialaxis=dict(range=[0, 100])),
+                           margin=dict(l=40, r=40, t=30, b=30),
+                           **PLOTLY_LAYOUT)
+        st.plotly_chart(figc, use_container_width=True)
+
+        # --- Policy table -------------------------------------------------------
+        st.markdown("### 🧠 What the agent learned (full policy — nothing hidden)")
+        st.dataframe(res["policy"], use_container_width=True, hide_index=True)
+
+        # --- Market dynamics strip ----------------------------------------------
+        st.markdown("### 🌍 Market dynamics modeling (TradeMaster MDM concept)")
+        recent = md.iloc[-504:]
+        figm = go.Figure()
+        for s_i, (style, color) in enumerate(zip(MDM_STYLES, MDM_COLORS)):
+            mask = recent["style"] == s_i
+            if mask.any():
+                figm.add_trace(go.Bar(x=recent.index[mask],
+                                      y=np.ones(int(mask.sum())),
+                                      marker_color=color, name=style,
+                                      marker_line_width=0))
+        figm.update_layout(height=140, barmode="stack", bargap=0,
+                           yaxis=dict(visible=False),
+                           margin=dict(l=10, r=10, t=10, b=10),
+                           **PLOTLY_LAYOUT)
+        st.plotly_chart(figm, use_container_width=True)
+        st.caption(f"Current market style: **{md['label'].iloc[-1]}**")
+
+        with st.expander("❓ What is this & why it's honest"):
+            st.markdown("""
+**The agent** learns the expected next-day return for each of 12 market states (trend × B-Xtrender × RSI) from the first 70% of history, with statistical shrinkage — it only acts on states where evidence clears a hurdle. This is the *contextual-bandit* form of reinforcement learning: since our tiny orders don't move the market, estimating the conditional edge IS the optimal policy — and unlike deep RL, it can't hallucinate patterns the data can't support.
+
+**Why the honesty obsession:** TradeMaster (NeurIPS 2023) and its PRUDEX-Compass benchmark exist because most published FinRL results don't survive out-of-sample testing. So this lab shows you ONLY out-of-sample performance, the full learned policy with sample counts and t-stats, and the compass comparison vs plain buy & hold. If the agent doesn't beat B&H on your ticker — that's the data talking, believe it.
+
+**Market dynamics strip:** the last 2 years labeled into 5 styles. Agents (and humans) trained mostly on bull data will be over-optimistic in bears — check what diet your agent grew up on.
 """)
 
 # ===========================================================================
