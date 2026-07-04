@@ -730,12 +730,14 @@ Workflow: scan → pick extremes → **🎯 Trade desk** for the full verdict. N
 # ===========================================================================
 with tab_backtest:
     st.subheader("Backtest the signal on any ticker")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     bt_tkr = c1.text_input("Ticker", value="AAPL", key="bt").upper().strip()
     bt_period = c2.selectbox("History", ["2y", "5y", "10y"], index=1)
     bt_cash = c3.number_input("Starting cash $", 500, 1_000_000, 5000,
                               step=500)
     bt_risk = c4.slider("Risk per trade %", 0.5, 5.0, 1.0, 0.5)
+    bt_mode = c5.selectbox("Engine", ["auto", "trend", "dip"], index=0,
+                           help="auto picks per ticker by Hurst exponent")
 
     if st.button("Run backtest", type="primary", key="btrun"):
         df = fetch_history(bt_tkr, period=bt_period)
@@ -743,11 +745,27 @@ with tab_backtest:
             st.error("Not enough history — need at least ~1 year.")
         else:
             cfg = BTConfig(starting_cash=float(bt_cash),
-                           risk_per_trade=bt_risk / 100)
+                           risk_per_trade=bt_risk / 100, mode=bt_mode)
             res = run_backtest(df, cfg)
+            st.caption(f"Engine used: **{res.mode_used.upper()}** "
+                       f"{'(picked automatically by Hurst)' if bt_mode == 'auto' else ''}")
             cols = st.columns(5)
             for col, (k, val) in zip(cols * 2, res.metrics.items()):
-                col.metric(k, val)
+                col.metric(k, val if val is not None else "—")
+
+            with st.expander("⚙️ What's inside the v2 engine?"):
+                st.markdown("""
+Two strategies, auto-selected per ticker by its **Hurst exponent**:
+- **TREND** — follows the 7-model composite signal. For tickers whose moves *continue* (H > 0.5).
+- **DIP** — Connors-style RSI(2) pullback buyer: buys short-term panic **inside an uptrend**, exits on the snap-back or a strict time limit. For choppier, mean-reverting names — historically one of the highest win-rate setups in the literature (65–78%).
+
+Risk mechanics on every trade:
+- **Regime gate (Faber 2007)** — longs only above the 200-day SMA. No knife-catching.
+- **Breakeven stop after +1R** — once the trade is one risk-unit in profit, the stop jumps to entry. Converts would-be losers into scratches → directly raises win rate.
+- **Time stop** — not working within 10–20 bars? Out. Dead capital is a cost.
+- **Volatility-targeted sizing (Moreira & Muir 2017)** — risk shrinks automatically when the stock's ATR% is elevated vs its own history.
+- Chandelier 2.5×ATR trail on trend trades, next-bar-open execution, commissions included.
+""")
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=res.equity.index, y=res.equity,
