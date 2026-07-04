@@ -15,7 +15,7 @@ import pandas as pd
 from .backtest import BTConfig, run_backtest
 from .signals import BUY_TH, SELL_TH, atr, composite, vol_regime
 
-MODELS = ["trend", "momentum", "macd", "rsi", "meanrev", "volume"]
+MODELS = ["trend", "momentum", "bxtrender", "macd", "rsi", "meanrev", "volume"]
 
 
 def analyze(df: pd.DataFrame, account: float = 5000.0,
@@ -97,10 +97,10 @@ def analyze(df: pd.DataFrame, account: float = 5000.0,
                            f"({SELL_TH} to {BUY_TH}) — no directional edge")
 
     if direction != 0:
-        if agree >= 4:
-            reasons_pro.append(f"{agree}/6 models agree on direction")
+        if agree >= 5:
+            reasons_pro.append(f"{agree}/{len(MODELS)} models agree on direction")
         else:
-            reasons_con.append(f"Only {agree}/6 models agree — mixed signals")
+            reasons_con.append(f"Only {agree}/{len(MODELS)} models agree — mixed signals")
 
     if regime >= 1.0:
         reasons_pro.append("Calm volatility regime — edges work best here")

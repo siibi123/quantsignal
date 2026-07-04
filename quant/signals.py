@@ -109,12 +109,13 @@ def vol_regime(df: pd.DataFrame) -> pd.Series:
 
 
 WEIGHTS = {
-    "trend": 0.30,
-    "momentum": 0.25,
-    "macd": 0.15,
+    "trend": 0.25,
+    "momentum": 0.20,
+    "bxtrender": 0.15,
+    "macd": 0.125,
     "rsi": 0.10,
     "meanrev": 0.10,
-    "volume": 0.10,
+    "volume": 0.075,
 }
 
 BUY_TH, SELL_TH = 0.25, -0.25
@@ -122,9 +123,11 @@ BUY_TH, SELL_TH = 0.25, -0.25
 
 def composite(df: pd.DataFrame) -> pd.DataFrame:
     """Return df of sub-scores + composite score + signal label per bar."""
+    from .bxtrender import score_bx
     parts = {
         "trend": score_trend(df),
         "momentum": score_momentum(df),
+        "bxtrender": score_bx(df),
         "macd": score_macd(df),
         "rsi": score_rsi(df),
         "meanrev": score_meanrev(df),
@@ -150,6 +153,7 @@ def latest_snapshot(df: pd.DataFrame) -> dict:
         "signal": str(last["signal"]),
         "trend": round(float(last["trend"]), 2),
         "momentum": round(float(last["momentum"]), 2),
+        "bxtrender": round(float(last["bxtrender"]), 2),
         "macd": round(float(last["macd"]), 2),
         "rsi_score": round(float(last["rsi"]), 2),
         "meanrev": round(float(last["meanrev"]), 2),
