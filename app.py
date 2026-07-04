@@ -14,6 +14,8 @@ from quant.backtest import BTConfig, run_backtest, walk_forward
 from quant.bxtrender import (bxtrender, detect_divergence, event_study,
                              weekly_alignment)
 from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
+from quant.flow import gex_profile, gex_summary, unusual_flow
+from quant.seasonality import fundamental_snapshot, monthly_seasonality
 from quant.levels import fib_levels, hurst
 from quant.montecarlo import cone, simulate, trade_odds
 from quant.options import (atm_term_structure, bs_greeks, build_surface,
@@ -575,7 +577,64 @@ Dominant swing detected: **{swing_dir}** from ${fib['swing_low']:,.2f} to ${fib[
 - **Support/resistance** (cyan/purple lines) — price zones where swing pivots *clustered*; the touch count shows how battle-tested each level is. Fib level + S/R level + your stop all in one zone = a level that actually matters.
 """)
 
-        # ---- 🧠 Model breakdown -----------------------------------------------------
+        st.markdown("---")
+
+        # ---- 📅 Seasonality + 🏦 Fundamentals (from the feed) ------------------
+        colS, colF = st.columns([1.3, 1])
+        with colS:
+            st.markdown("### 📅 Seasonality — Detrick-style stats")
+            seas = monthly_seasonality(fetch_history(tkr, period="10y"))
+            if len(seas):
+                import datetime as _dt
+                cur_m = _dt.date.today().strftime("%b")
+                def _hl(row):
+                    return ["background-color: rgba(16,185,129,.18)"
+                            if row.name == cur_m else "" for _ in row]
+                st.dataframe(seas.style.apply(_hl, axis=1)
+                             .background_gradient(subset=["avg return %"],
+                                                  cmap="RdYlGn"),
+                             use_container_width=True, height=460)
+                if cur_m in seas.index:
+                    r = seas.loc[cur_m]
+                    st.caption(f"**{cur_m} historically:** up "
+                               f"{r['win rate %']:.0f}% of years, average "
+                               f"{r['avg return %']:+.2f}% "
+                               f"({int(r['years'])} years of data).")
+            else:
+                st.info("Not enough history for seasonality stats.")
+        with colF:
+            st.markdown("### 🏦 Fundamentals check")
+            st.caption("\"Price follows growth & margin & free cash flow\"")
+            fund = fundamental_snapshot(tkr)
+            if fund and fund.get("quality_score"):
+                f1, f2 = st.columns(2)
+                rg = fund.get("revenue_growth")
+                gm = fund.get("gross_margin")
+                om = fund.get("op_margin")
+                fy = fund.get("fcf_yield")
+                pe = fund.get("fwd_pe")
+                f1.metric("Revenue growth (yoy)",
+                          f"{rg*100:.1f}%" if rg is not None else "—")
+                f2.metric("Gross margin",
+                          f"{gm*100:.1f}%" if gm is not None else "—")
+                f1.metric("Operating margin",
+                          f"{om*100:.1f}%" if om is not None else "—")
+                f2.metric("FCF yield",
+                          f"{fy*100:.1f}%" if fy is not None else "—")
+                f1.metric("Forward P/E",
+                          f"{pe:.1f}" if pe else "—")
+                f2.metric("Quality score", fund["quality_score"])
+            else:
+                st.info("Fundamentals unavailable for this ticker (ETFs "
+                        "have none; some names return partial data).")
+            with st.expander("❓ What are these & the thresholds?"):
+                st.markdown("""
+The 4-point quality check (1 point each): revenue growth ≥ 10%, gross margin ≥ 40%, operating margin ≥ 15%, FCF yield ≥ 3%. Quality growth compounders tend to score 3-4; melting ice cubes and story-stocks score 0-1. A great technical setup on a 0/4 business deserves a smaller size and a shorter leash. Seasonality: the highlighted row is the current month — a headwind or tailwind stat, never a signal by itself.
+""")
+
+        st.markdown("---")
+
+        # ---- 🧠 Model breakdown
         st.markdown("### 🧠 Model breakdown")
         last = comp.iloc[-1]
         sub = last[["trend", "momentum", "bxtrender", "macd", "rsi",
@@ -815,6 +874,66 @@ with tab_options:
 - **Put/Call OI ratio** — total put open interest ÷ calls. Extremes are contrarian: >1.2 = fear (often near bottoms), <0.6 = greed.
 - **Max pain** — the strike where option *holders* lose the most at expiry. Price often gravitates toward it into expiration week (dealers hedging), a real but modest effect.
 """)
+
+
+            # ---- 🐋 Dealer gamma & whale flow ---------------------------------
+            st.markdown("### 🐋 Dealer gamma exposure (GEX) & whale flow")
+            prof = gex_profile(chain, spot)
+            summ = gex_summary(prof, spot)
+            if summ:
+                gm1, gm2, gm3, gm4, gm5 = st.columns(5)
+                gm1.metric("Net GEX", f"${summ['net_gex_m']:,.0f}M")
+                gm2.metric("Regime", summ["regime"].split(" ")[0] + " " +
+                           summ["regime"].split(" ")[1])
+                gm3.metric("Call wall", f"${summ['call_wall']:,.0f}")
+                gm4.metric("Put wall", f"${summ['put_wall']:,.0f}")
+                gm5.metric("Gamma flip",
+                           f"${summ['flip']:,.0f}" if summ["flip"] else "—",
+                           delta=summ["spot_vs_flip"], delta_color="off")
+
+                colors_gex = np.where(prof["gex_m"] >= 0, "#10b981", "#ef4444")
+                figg = go.Figure(go.Bar(x=prof["strike"], y=prof["gex_m"],
+                                        marker_color=colors_gex,
+                                        name="Net GEX $M"))
+                figg.add_vline(x=spot, line_dash="dot", line_color="#e6edf3",
+                               annotation_text=f"spot ${spot:,.0f}")
+                if summ["flip"]:
+                    figg.add_vline(x=summ["flip"], line_dash="dash",
+                                   line_color="#f59e0b",
+                                   annotation_text="flip")
+                figg.update_layout(height=380, xaxis_title="Strike",
+                                   yaxis_title="Net GEX ($M per 1% move)",
+                                   margin=dict(l=10, r=10, t=30, b=10),
+                                   **PLOTLY_LAYOUT)
+                st.plotly_chart(figg, use_container_width=True)
+
+                with st.expander("❓ GEX, walls & the flip — the flow-trader playbook"):
+                    st.markdown("""
+Dealers who sell options must hedge them by trading the stock — mechanically, without opinion. **GEX** estimates how much:
+
+- **Positive net GEX (🧲 pinning)** — dealers buy dips and sell rips. Price gets *magnetized* between the walls; ranges, boring days, failed breakouts.
+- **Negative net GEX (⛽ vol fuel)** — dealers must sell INTO drops and buy INTO rallies, amplifying every move. Crashes and face-rippers live here.
+- **Call wall** — the strike with peak positive gamma; acts as resistance/pin magnet into expiry.
+- **Put wall** — peak negative gamma; the air-pocket level where support turns to acceleration.
+- **Gamma flip** — the spot level where the regime changes. Above it = stable zone, below = unstable. Watch what happens when price approaches it.
+
+This is the same math behind the paid flow dashboards — computed from public open interest.
+""")
+
+            st.markdown("### 🔥 Unusual activity (fresh positioning)")
+            uf = unusual_flow(chain)
+            if len(uf):
+                st.dataframe(uf, use_container_width=True, hide_index=True,
+                             height=380)
+                with st.expander("❓ How to read the flow table"):
+                    st.markdown("""
+- **vol/oi > 1** 🔥 — more contracts traded today than existed before: someone is OPENING a fresh position, not closing an old one. That's the signature flow-traders hunt.
+- **premium $** — the actual money behind it. A million in premium is conviction; $5K is noise.
+- Caveats the paid services rarely mention: you can't see if it's a buy or a sell from delayed data, and big prints are often hedges or spread legs. Treat as *context*, never as a signal alone.
+""")
+            else:
+                st.info("No contracts with meaningful volume right now "
+                        "(quiet session or delayed data).")
 
             strikes, dtes, grid = build_surface(chain)
             if grid.size:
