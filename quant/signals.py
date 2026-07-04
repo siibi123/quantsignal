@@ -161,4 +161,5 @@ def latest_snapshot(df: pd.DataFrame) -> dict:
         "ret_1m": round(float(df["Close"].pct_change(21).iloc[-1] * 100), 1),
         "ret_3m": round(float(df["Close"].pct_change(63).iloc[-1] * 100), 1)
         if len(df) > 63 else None,
+        "off_52w_high": round(float(price / df["High"].rolling(min(252, len(df))).max().iloc[-1] - 1) * 100, 1),
     }

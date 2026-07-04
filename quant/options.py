@@ -168,3 +168,28 @@ def skew_25(df: pd.DataFrame) -> float | None:
     if pd.isna(put_wing) or pd.isna(call_wing):
         return None
     return round(float(put_wing - call_wing), 2)
+
+
+def put_call_ratio(df: pd.DataFrame) -> float | None:
+    """Total put OI / call OI across loaded expiries."""
+    if df.empty:
+        return None
+    p = df[df["type"] == "P"]["oi"].fillna(0).sum()
+    c = df[df["type"] == "C"]["oi"].fillna(0).sum()
+    return round(float(p / c), 2) if c > 0 else None
+
+
+def max_pain(df: pd.DataFrame, expiry: str) -> float | None:
+    """Strike where total option-holder payout is minimised at expiry."""
+    sub = df[df["expiry"] == expiry]
+    if sub.empty:
+        return None
+    strikes = np.sort(sub["strike"].unique())
+    calls = sub[sub["type"] == "C"].groupby("strike")["oi"].sum()
+    puts = sub[sub["type"] == "P"].groupby("strike")["oi"].sum()
+    pain = []
+    for s in strikes:
+        call_pay = sum(max(s - k, 0) * calls.get(k, 0) for k in calls.index)
+        put_pay = sum(max(k - s, 0) * puts.get(k, 0) for k in puts.index)
+        pain.append(call_pay + put_pay)
+    return round(float(strikes[int(np.argmin(pain))]), 2)

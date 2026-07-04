@@ -1,11 +1,13 @@
-"""QuantSignal — quant trade desk, screener & backtester for US stocks."""
+"""QuantSignal — neon-terminal quant desk for US stocks."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
+from quant.advanced import ewma_vol, kelly, regime_quadrant, support_resistance
 from quant.backtest import BTConfig, run_backtest, walk_forward
 from quant.bxtrender import (bxtrender, detect_divergence, event_study,
                              weekly_alignment)
@@ -13,69 +15,132 @@ from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
 from quant.levels import fib_levels, hurst
 from quant.montecarlo import cone, simulate, trade_odds
 from quant.options import (atm_term_structure, bs_greeks, build_surface,
-                           fetch_chains, skew_25)
+                           fetch_chains, max_pain, put_call_ratio, skew_25)
 from quant.signals import BUY_TH, SELL_TH, atr, composite, latest_snapshot
 from quant.verdict import analyze
 
 st.set_page_config(page_title="QuantSignal", page_icon="📈", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Global styling — terminal-grade dark UI
+# NEON TERMINAL styling
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800;900&family=JetBrains+Mono:wght@500;700&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-.hero-title {
-  font-size: 3rem; font-weight: 900; letter-spacing: -1.5px; margin: 0;
-  background: linear-gradient(90deg, #10b981 0%, #34d399 40%, #6ee7b7 100%);
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+.stApp {
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(16,185,129,.13), transparent),
+    radial-gradient(ellipse 60% 40% at 90% 10%, rgba(59,130,246,.07), transparent),
+    linear-gradient(180deg, #070b10 0%, #0b0f14 100%);
 }
-.hero-sub { color: #8b98a5; font-size: .95rem; margin-top: 2px; }
+.stApp::before {
+  content:""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background-image:
+    linear-gradient(rgba(16,185,129,.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(16,185,129,.03) 1px, transparent 1px);
+  background-size: 42px 42px;
+}
+
+.hero-title {
+  font-size: 3.2rem; font-weight: 900; letter-spacing: -2px; margin: 0;
+  background: linear-gradient(90deg, #10b981 0%, #34d399 35%, #22d3ee 75%, #60a5fa 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 0 24px rgba(16,185,129,.35));
+}
+.hero-sub { color: #8b98a5; font-size: .95rem; margin-top: 4px; }
+.chips { margin-top: 10px; }
+.chip {
+  display:inline-block; padding: 4px 12px; margin: 0 6px 6px 0;
+  border-radius: 999px; font-size: .75rem; font-weight: 600;
+  color: #6ee7b7; background: rgba(16,185,129,.08);
+  border: 1px solid rgba(16,185,129,.35);
+}
+
+.stTabs [data-baseweb="tab-list"] {
+  gap: 6px; background: rgba(19,26,34,.6); padding: 6px;
+  border-radius: 14px; border: 1px solid #1f2a36;
+}
+.stTabs [data-baseweb="tab"] {
+  border-radius: 10px; padding: 8px 18px; font-weight: 600;
+}
+.stTabs [aria-selected="true"] {
+  background: linear-gradient(135deg, rgba(16,185,129,.25), rgba(34,211,238,.12)) !important;
+  border: 1px solid rgba(16,185,129,.5);
+  box-shadow: 0 0 18px rgba(16,185,129,.25);
+}
 
 [data-testid="stMetric"] {
-  background: linear-gradient(180deg, #141c26 0%, #10161e 100%);
-  border: 1px solid #1f2a36; border-radius: 14px; padding: 14px 16px;
-  transition: border-color .2s;
+  background: linear-gradient(180deg, rgba(23,32,42,.85) 0%, rgba(14,20,27,.9) 100%);
+  border: 1px solid #1f2a36; border-radius: 16px; padding: 14px 16px;
+  backdrop-filter: blur(8px); transition: all .25s ease;
 }
-[data-testid="stMetric"]:hover { border-color: #10b98155; }
+[data-testid="stMetric"]:hover {
+  border-color: rgba(16,185,129,.6);
+  box-shadow: 0 0 22px rgba(16,185,129,.18); transform: translateY(-2px);
+}
 [data-testid="stMetricValue"] { font-weight: 800; font-family: 'JetBrains Mono', monospace; }
 [data-testid="stMetricLabel"] { color: #8b98a5; }
 
 div[data-testid="stExpander"] {
-  border: 1px dashed #2a3644; border-radius: 12px; background: #0f151d;
+  border: 1px dashed rgba(16,185,129,.35); border-radius: 14px;
+  background: rgba(15,21,29,.7);
 }
 
 .verdict {
-  border-radius: 18px; padding: 28px 32px; margin: 8px 0 16px 0;
+  border-radius: 20px; padding: 30px 34px; margin: 10px 0 18px 0;
   display: flex; align-items: center; justify-content: space-between;
-  box-shadow: 0 8px 32px rgba(0,0,0,.35);
+  box-shadow: 0 10px 44px rgba(0,0,0,.45); backdrop-filter: blur(6px);
 }
-.verdict h2 { margin: 0; font-size: 2.4rem; font-weight: 900; letter-spacing: -1px; }
+.verdict h2 { margin: 0; font-size: 2.5rem; font-weight: 900; letter-spacing: -1px; }
 .verdict .sub { opacity: .85; font-size: .95rem; margin-top: 6px; }
-.v-long  { background: linear-gradient(135deg,#053b2d,#065f46 60%,#047857); border:1px solid #10b981; }
-.v-short { background: linear-gradient(135deg,#5f1414,#991b1b 60%,#b91c1c); border:1px solid #ef4444; }
-.v-none  { background: linear-gradient(135deg,#1a2332,#2b3648 60%,#374151); border:1px solid #6b7280; }
+.v-long  { background: linear-gradient(135deg, rgba(5,59,45,.95), rgba(6,95,70,.9) 60%, rgba(4,120,87,.85));
+           border: 1px solid #10b981; box-shadow: 0 0 46px rgba(16,185,129,.30); }
+.v-short { background: linear-gradient(135deg, rgba(95,20,20,.95), rgba(153,27,27,.9) 60%, rgba(185,28,28,.85));
+           border: 1px solid #ef4444; box-shadow: 0 0 46px rgba(239,68,68,.30); }
+.v-none  { background: linear-gradient(135deg, rgba(26,35,50,.95), rgba(43,54,72,.9) 60%, rgba(55,65,81,.85));
+           border: 1px solid #6b7280; }
 
 .reason-pro, .reason-con {
   border-radius: 10px; padding: 9px 14px; margin: 6px 0; font-size: .92rem;
 }
-.reason-pro { background:#0b2e22; border-left: 3px solid #10b981; }
-.reason-con { background:#2e0f0f; border-left: 3px solid #ef4444; }
-.conv-wrap { background:#1f2a36; border-radius: 8px; height: 16px; width: 100%; }
-.conv-bar  { height: 16px; border-radius: 8px;
-  background-image: linear-gradient(90deg, transparent 0, rgba(255,255,255,.18) 50%, transparent 100%);
-  background-size: 40px 100%; }
+.reason-pro { background: rgba(11,46,34,.8); border-left: 3px solid #10b981; }
+.reason-con { background: rgba(46,15,15,.8); border-left: 3px solid #ef4444; }
+
+.conv-wrap { background:#1f2a36; border-radius: 8px; height: 16px; width: 100%; overflow:hidden; }
+.conv-bar  { height: 16px; border-radius: 8px; position: relative; }
+.conv-bar::after {
+  content:""; position:absolute; inset:0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.35), transparent);
+  animation: shimmer 2.2s infinite; transform: translateX(-100%);
+}
+@keyframes shimmer { 100% { transform: translateX(100%); } }
+
+.regime-badge {
+  display:inline-block; padding: 8px 18px; border-radius: 12px;
+  font-weight: 800; font-size: 1.05rem; letter-spacing: .3px;
+  background: rgba(19,26,34,.9); border: 1px solid #2a3644;
+}
 hr { border-color: #1f2a36; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #1f2a36; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(16,185,129,.5); }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<p class="hero-title">QuantSignal</p>'
-            '<p class="hero-sub">Trend · Momentum · Mean-reversion · '
-            'Volatility regimes · Monte Carlo · Fibonacci · Black-Scholes — '
-            'fused into one decision. Educational tool, not financial advice.'
-            '</p>', unsafe_allow_html=True)
+st.markdown('''
+<p class="hero-title">QuantSignal</p>
+<p class="hero-sub">Institutional-grade quant desk — every model fused into one decision.
+Educational tool, not financial advice.</p>
+<div class="chips">
+<span class="chip">7-model composite</span><span class="chip">B-Xtrender</span>
+<span class="chip">Monte Carlo</span><span class="chip">Kelly sizing</span>
+<span class="chip">EWMA vol</span><span class="chip">Fibonacci</span>
+<span class="chip">Black-Scholes</span><span class="chip">IV surface</span>
+<span class="chip">Max pain</span><span class="chip">Walk-forward</span>
+</div>
+''', unsafe_allow_html=True)
 st.write("")
 
 PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
@@ -105,7 +170,7 @@ with tab_desk:
     use_opts = c4.toggle("Include options skew (slower)", value=False)
 
     if st.button("Run desk analysis", type="primary", key="deskrun"):
-        with st.spinner("Crunching signals, edge history, Monte Carlo & levels…"):
+        with st.spinner("Crunching 7 models, Monte Carlo, vol forecast & levels…"):
             df = fetch_history(tkr, period="2y")
             if df.empty or len(df) < 260:
                 st.error(f"Not enough data for {tkr} (need ~1y of history).")
@@ -120,13 +185,37 @@ with tab_desk:
             v = analyze(df, account=account, risk_pct=risk_pct, skew=skew)
             h = hurst(df)
             fib = fib_levels(df)
+            reg = regime_quadrant(df)
+            vol = ewma_vol(df)
+            sr = support_resistance(df)
             direction = 1 if v["verdict"] != "SHORT" else -1
             paths = simulate(df, days=30, n_paths=2000)
             odds = trade_odds(paths, v["entry"], v["stop"], v["target"],
                               direction)
             bands = cone(paths)
+            p_win = (odds["p_target_first"] /
+                     max(odds["p_target_first"] + odds["p_stop_first"], 1e-9))
+            kel = kelly(p_win, v["rr"])
 
-        # ---- Verdict banner ------------------------------------------------
+        # ---- Regime + vol forecast row --------------------------------------
+        rg1, rg2, rg3, rg4 = st.columns([1.6, 1, 1, 1])
+        rg1.markdown(f"<div class='regime-badge'>{reg['regime']}</div>"
+                     f"<div style='color:#8b98a5;font-size:.85rem;margin-top:6px'>"
+                     f"{reg['playbook']}</div>", unsafe_allow_html=True)
+        rg2.metric("EWMA vol (annual)", f"{vol['sigma_annual_pct']}%")
+        rg3.metric("Expected move (1 day)", f"±${vol['expected_move_1d']:,.2f}")
+        rg4.metric("Hurst exponent", h,
+                   delta="trending" if h > 0.55 else
+                   "mean-reverting" if h < 0.45 else "random walk",
+                   delta_color="off")
+        with st.expander("❓ Regime, EWMA volatility & Hurst — why they matter"):
+            st.markdown("""
+- **Regime quadrant** — price vs its 200-day average (bull/bear) × current volatility vs its own history (calm/storm). Each quadrant has a playbook; most losing streaks come from running a bull-calm playbook in a bear-storm.
+- **EWMA vol (RiskMetrics λ=0.94)** — the industry-standard forecast of tomorrow's volatility, weighting recent days most. The ± number is the *expected* one-day move: intraday wiggles inside it are noise, not signal.
+- **Hurst exponent** — the ticker's memory. >0.5 moves tend to continue (trust trend models), <0.5 they reverse (trust mean-reversion), ≈0.5 random walk.
+""")
+
+        # ---- Verdict banner ---------------------------------------------------
         cls = VERDICT_CLASS[v["verdict"]]
         conv_color = ("#10b981" if v["verdict"] == "LONG"
                       else "#ef4444" if v["verdict"] == "SHORT" else "#6b7280")
@@ -135,8 +224,7 @@ with tab_desk:
           <div>
             <h2>{VERDICT_EMOJI[v['verdict']]} {v['verdict']} — {tkr}</h2>
             <div class="sub">Composite {v['score']:+.2f} · {v['agree']}/7 models aligned ·
-              signal Sharpe on {tkr}: {v['sharpe']} ({v['n_trades']} trades) ·
-              Hurst {h}</div>
+              signal Sharpe on {tkr}: {v['sharpe']} ({v['n_trades']} trades)</div>
           </div>
           <div style="min-width:230px">
             <div style="font-size:.85rem;opacity:.8;margin-bottom:4px">
@@ -148,13 +236,13 @@ with tab_desk:
         """, unsafe_allow_html=True)
 
         with st.expander("❓ What is the verdict & conviction?"):
-            st.markdown(f"""
-- **The verdict** fuses seven models (trend, momentum, B-Xtrender, MACD, RSI, mean-reversion, volume) into one composite score, then demands: models agreeing, a calm volatility regime, a *proven* historical edge on this exact ticker, and risk/reward ≥ 1.3. Fail any → **NO TRADE**. Standing aside is a position.
-- **Conviction (0–100)**: 40% signal strength + 25% model agreement + 15% volatility regime + 20% historical edge (± options skew). Above 55 = tradeable.
-- **Hurst exponent ({h})**: measures the ticker's *character*. Above 0.5 → moves tend to **continue** (trust trend/momentum models). Below 0.5 → moves tend to **reverse** (trust mean-reversion). Near 0.5 → random walk, no memory.
+            st.markdown("""
+The verdict fuses seven models (trend, momentum, B-Xtrender, MACD, RSI, mean-reversion, volume) into one composite score, then demands: models agreeing, a calm volatility regime, a *proven* historical edge on this exact ticker, and risk/reward ≥ 1.3. Fail any → **NO TRADE**. Standing aside is a position.
+
+**Conviction (0–100)**: 40% signal strength + 25% model agreement + 15% volatility regime + 20% historical edge (± options skew). Above 55 = tradeable.
 """)
 
-        # ---- Levels ---------------------------------------------------------
+        # ---- Levels -------------------------------------------------------------
         if v["verdict"] != "NO TRADE":
             m = st.columns(6)
             m[0].metric("Entry", f"${v['entry']:,.2f}")
@@ -168,16 +256,16 @@ with tab_desk:
                            "unavailable, treat SHORT as **avoid / exit longs**.")
             with st.expander("❓ How are these levels computed?"):
                 st.markdown("""
-- **Stop** = entry ± 2.5×ATR (Average True Range — the stock's typical daily wiggle). Wide enough to survive noise, tight enough to cap damage.
-- **Target** = the 63-day swing high/low, or a 2R measured move on breakouts to new highs (no overhead resistance to aim at).
-- **Shares** = sized so a stop-out loses exactly your chosen % of the account. This is the single most important number on this page.
+- **Stop** = entry ± 2.5×ATR — wide enough to survive noise, tight enough to cap damage.
+- **Target** = the 63-day swing level, or a 2R measured move on breakouts to new highs.
+- **Shares** = sized so a stop-out loses exactly your chosen % of the account.
 """)
         else:
             st.info("**Standing aside is a position.** The desk found no edge "
                     "worth risking money on right now — that's the system "
                     "working, not failing.")
 
-        # ---- Reasons ---------------------------------------------------------
+        # ---- Reasons -------------------------------------------------------------
         colp, colc = st.columns(2)
         with colp:
             st.markdown("**✅ For**")
@@ -185,28 +273,30 @@ with tab_desk:
                 st.markdown(f"<div class='reason-pro'>{r}</div>",
                             unsafe_allow_html=True)
             if not v["reasons_pro"]:
-                st.markdown("<div class='reason-con'>Nothing working in "
-                            "favour right now</div>", unsafe_allow_html=True)
+                st.markdown("<div class='reason-con'>Nothing working in favour "
+                            "right now</div>", unsafe_allow_html=True)
         with colc:
             st.markdown("**⚠️ Against**")
             for r in v["reasons_con"]:
                 st.markdown(f"<div class='reason-con'>{r}</div>",
                             unsafe_allow_html=True)
             if not v["reasons_con"]:
-                st.markdown("<div class='reason-pro'>No red flags "
-                            "detected</div>", unsafe_allow_html=True)
+                st.markdown("<div class='reason-pro'>No red flags detected</div>",
+                            unsafe_allow_html=True)
 
         st.markdown("---")
 
-        # ---- 🎲 Monte Carlo -------------------------------------------------
+        # ---- 🎲 Monte Carlo + Kelly ------------------------------------------------
         st.markdown("### 🎲 Monte Carlo — 2,000 simulated futures (30 days)")
         mc = st.columns(6)
         mc[0].metric("P(hit target first)", f"{odds['p_target_first']}%")
         mc[1].metric("P(hit stop first)", f"{odds['p_stop_first']}%")
-        mc[2].metric("P(neither in 30d)", f"{odds['p_neither']}%")
-        mc[3].metric("P(profitable at day 30)", f"{odds['p_profit_end']}%")
-        mc[4].metric("95% VaR / share", f"${odds['var95_share']:,.2f}")
-        mc[5].metric("95% CVaR / share", f"${odds['cvar95_share']:,.2f}")
+        mc[2].metric("P(profitable at day 30)", f"{odds['p_profit_end']}%")
+        mc[3].metric("95% CVaR / share", f"${odds['cvar95_share']:,.2f}")
+        mc[4].metric("Kelly optimal size", f"{kel['kelly_pct']}%" if
+                     kel["edge_positive"] else "No edge")
+        mc[5].metric("Half-Kelly (use this)", f"{kel['half_kelly_pct']}%" if
+                     kel["edge_positive"] else "—")
 
         x = list(range(paths.shape[1]))
         figmc = go.Figure()
@@ -235,69 +325,19 @@ with tab_desk:
                             yaxis_title="Price $", **PLOTLY_LAYOUT)
         st.plotly_chart(figmc, use_container_width=True)
 
-        with st.expander("❓ What is Monte Carlo & how do I read this?"):
+        with st.expander("❓ Monte Carlo & Kelly — how to read this"):
             st.markdown(f"""
-This simulates **2,000 alternative futures** for {tkr} using Geometric Brownian Motion, calibrated to *its own* recent drift and volatility (recent days weighted heavier).
+2,000 alternative futures simulated with Geometric Brownian Motion calibrated to {tkr}'s own recent drift & volatility.
 
-- **The cone**: dark band = the middle 50% of futures, light band = 90%. A price outside the cone in reality = the market changed character.
-- **P(hit target first) vs P(hit stop first)**: which level do the simulations touch first? This is your *simulated win rate* for this exact trade — compare it with the risk/reward. A 40% win rate is great when RR is 2:1.
-- **VaR 95%**: in the worst 5% of futures, you lose at least this much per share. **CVaR**: the *average* loss inside that worst 5% — the "how bad is bad" number professional desks size by.
+- **The cone** — dark band = middle 50% of futures, light = 90%. Reality outside the cone = the market changed character.
+- **P(target first) vs P(stop first)** — your *simulated win rate* for this exact trade setup.
+- **CVaR 95%** — the average loss in the worst 5% of futures. The "how bad is bad" number desks size by.
+- **Kelly criterion** — the mathematically optimal fraction of capital: f* = p − (1−p)/RR. Full Kelly is a wild ride; **half-Kelly** keeps ~75% of the growth at half the pain, which is why pros use it. "No edge" = the simulated odds don't justify the trade at all.
 """)
 
         st.markdown("---")
 
-        # ---- 📐 Chart with Fibonacci + levels --------------------------------
-        st.markdown("### 📐 Price structure — Fibonacci retracements & levels")
-        comp = composite(df)
-        figp = go.Figure()
-        figp.add_trace(go.Candlestick(
-            x=df.index[-252:], open=df["Open"][-252:], high=df["High"][-252:],
-            low=df["Low"][-252:], close=df["Close"][-252:], name=tkr))
-        for key, price in fib["levels"].items():
-            figp.add_hline(y=price, line_dash="dot", line_width=1,
-                           line_color=FIB_COLORS.get(key, "#8b98a5"),
-                           annotation_text=f"Fib {key} — ${price:,.2f}",
-                           annotation_font_size=10,
-                           annotation_font_color=FIB_COLORS.get(key, "#8b98a5"))
-        if v["verdict"] != "NO TRADE":
-            for lvl, name, color in ((v["stop"], "STOP", "#ef4444"),
-                                     (v["target"], "TARGET", "#10b981")):
-                figp.add_hline(y=lvl, line_width=2, line_color=color,
-                               annotation_text=name,
-                               annotation_font_color=color)
-        buys = [d for d in comp[comp["signal"] == "BUY"].index[-252:]
-                if d in df.index[-252:]]
-        sells = [d for d in comp[comp["signal"] == "SELL"].index[-252:]
-                 if d in df.index[-252:]]
-        figp.add_trace(go.Scatter(x=buys, y=df.loc[buys, "Low"] * 0.985,
-                                  mode="markers", name="BUY zone",
-                                  marker=dict(symbol="triangle-up", size=7,
-                                              color="#10b981")))
-        figp.add_trace(go.Scatter(x=sells, y=df.loc[sells, "High"] * 1.015,
-                                  mode="markers", name="SELL zone",
-                                  marker=dict(symbol="triangle-down", size=7,
-                                              color="#ef4444")))
-        figp.update_layout(height=560, xaxis_rangeslider_visible=False,
-                           margin=dict(l=10, r=10, t=30, b=10),
-                           **PLOTLY_LAYOUT)
-        st.plotly_chart(figp, use_container_width=True)
-
-        swing_dir = "upswing" if fib["up_swing"] else "downswing"
-        with st.expander("❓ What are Fibonacci retracements?"):
-            st.markdown(f"""
-The dominant swing detected in the last ~6 months: **{swing_dir}** from ${fib['swing_low']:,.2f} to ${fib['swing_high']:,.2f}.
-
-Fibonacci retracements mark how much of a move typically gets "given back" before the trend resumes. The levels traders actually watch:
-- **0.382 / 0.5** — shallow pullback: strong trend, buyers stepping in early
-- **0.618** — the "golden pocket": the classic spot where healthy pullbacks end. Bounce here = trend intact
-- **0.786** — last defence; below it the swing is usually considered broken
-
-They work partly because *so many traders watch them* (self-fulfilling). Use them as **zones to expect a reaction**, not as magic lines — best combined with the verdict above.
-""")
-
-        st.markdown("---")
-
-        # ---- ⚡ B-Xtrender (institutional) -----------------------------------
+        # ---- ⚡ B-Xtrender -----------------------------------------------------
         st.markdown("### ⚡ B-Xtrender — institutional edition")
         bx = bxtrender(df)
         div = detect_divergence(df)
@@ -321,8 +361,6 @@ They work partly because *so many traders watch them* (self-fulfilling). Use the
         if div["detail"]:
             st.caption(f"Divergence detail: {div['detail']}")
 
-        # Two-pane oscillator chart, TradingView style
-        from plotly.subplots import make_subplots
         w = df.index[-252:]
         bxw = bx.loc[w]
         so, t3l = bxw["short_osc"], bxw["t3"]
@@ -346,12 +384,12 @@ They work partly because *so many traders watch them* (self-fulfilling). Use the
         sells_bx = w[bxw["sell_turn"].values]
         figbx.add_trace(go.Scatter(x=buys_bx, y=t3l.loc[buys_bx],
                                    mode="markers", name="Buy turn",
-                                   marker=dict(color="#22ff44", size=9,
-                                               symbol="circle")), row=1, col=1)
+                                   marker=dict(color="#22ff44", size=9)),
+                        row=1, col=1)
         figbx.add_trace(go.Scatter(x=sells_bx, y=t3l.loc[sells_bx],
                                    mode="markers", name="Sell turn",
-                                   marker=dict(color="#ff5555", size=9,
-                                               symbol="circle")), row=1, col=1)
+                                   marker=dict(color="#ff5555", size=9)),
+                        row=1, col=1)
         figbx.add_trace(go.Bar(x=w, y=lo, marker_color=colors_l,
                                name="Long osc", showlegend=False), row=2, col=1)
         figbx.add_hline(y=0, line_color="#2a3644", row=1, col=1)
@@ -366,39 +404,91 @@ They work partly because *so many traders watch them* (self-fulfilling). Use the
 
         with st.expander("❓ What is B-Xtrender & the upgrades here?"):
             st.markdown("""
-**B-Xtrender** (Bharat Jhunjhunwala, IFTA Journal) is a double-smoothed momentum oscillator: an RSI applied to the *spread between two EMAs*, filtered by a Tillson T3 line. It reacts faster than MACD with less noise than raw RSI.
+**B-Xtrender** (Bharat Jhunjhunwala, IFTA Journal) — an RSI applied to the *spread between two EMAs*, filtered by a Tillson T3 line. Faster than MACD, cleaner than raw RSI.
 
-How to read it:
-- **Short oscillator (top)** — bright green/red = accelerating, dark = decelerating. The white **T3 line** is the smoothed heartbeat; the 🟢/🔴 dots are **turn signals** where it flips.
-- **Long oscillator (bottom)** — the trend filter. Institutional rule: only take buy turns when the long oscillator is **above zero** (and vice versa).
-
-The institutional upgrades:
-- **MTF alignment** — the same oscillator computed on weekly bars. Daily signals *against* the weekly trend are how retail gets chopped up.
-- **Divergence** — price making new highs while the oscillator makes lower highs = momentum is quietly leaving the move. The classic institutional exit tell.
-- **Event study** — the table above measures every historical turn on this exact ticker: average forward return and win rate 5/10/20 days later. If buy turns only won 45% of the time on this name, now you know — trust data, not paint.
+- **Short oscillator (top)** — bright = accelerating, dark = decelerating. Dots on the white T3 line = turn signals.
+- **Long oscillator (bottom)** — the trend filter. Institutional rule: only take buy turns when it's above zero.
+- **MTF alignment** — the same oscillator on weekly bars. Daily signals against the weekly trend are how retail gets chopped.
+- **Divergence** — price at new highs while the oscillator makes lower highs = momentum quietly leaving.
+- **Event study** — every historical turn on this exact ticker, measured: average forward return and win rate 5/10/20 days later. Trust data, not paint.
 """)
 
         st.markdown("---")
 
-        # ---- 🧠 Model breakdown
+        # ---- 📐 Price structure ---------------------------------------------------
+        st.markdown("### 📐 Price structure — Fibonacci, support & resistance")
+        comp = composite(df)
+        figp = go.Figure()
+        figp.add_trace(go.Candlestick(
+            x=df.index[-252:], open=df["Open"][-252:], high=df["High"][-252:],
+            low=df["Low"][-252:], close=df["Close"][-252:], name=tkr))
+        for key, price in fib["levels"].items():
+            figp.add_hline(y=price, line_dash="dot", line_width=1,
+                           line_color=FIB_COLORS.get(key, "#8b98a5"),
+                           annotation_text=f"Fib {key} — ${price:,.2f}",
+                           annotation_font_size=10,
+                           annotation_font_color=FIB_COLORS.get(key, "#8b98a5"))
+        for lv in sr:
+            col = "#22d3ee" if lv["kind"] == "resistance" else "#a78bfa"
+            figp.add_hline(y=lv["price"], line_width=2, line_color=col,
+                           opacity=.7,
+                           annotation_text=f"{lv['kind'].upper()} "
+                                           f"${lv['price']:,.2f} "
+                                           f"({lv['touches']} touches)",
+                           annotation_font_color=col,
+                           annotation_font_size=10)
+        if v["verdict"] != "NO TRADE":
+            for lvl, name, color in ((v["stop"], "STOP", "#ef4444"),
+                                     (v["target"], "TARGET", "#10b981")):
+                figp.add_hline(y=lvl, line_width=2, line_color=color,
+                               annotation_text=name,
+                               annotation_font_color=color)
+        buys = [d for d in comp[comp["signal"] == "BUY"].index[-252:]
+                if d in df.index[-252:]]
+        sells = [d for d in comp[comp["signal"] == "SELL"].index[-252:]
+                 if d in df.index[-252:]]
+        figp.add_trace(go.Scatter(x=buys, y=df.loc[buys, "Low"] * 0.985,
+                                  mode="markers", name="BUY zone",
+                                  marker=dict(symbol="triangle-up", size=7,
+                                              color="#10b981")))
+        figp.add_trace(go.Scatter(x=sells, y=df.loc[sells, "High"] * 1.015,
+                                  mode="markers", name="SELL zone",
+                                  marker=dict(symbol="triangle-down", size=7,
+                                              color="#ef4444")))
+        figp.update_layout(height=580, xaxis_rangeslider_visible=False,
+                           margin=dict(l=10, r=10, t=30, b=10),
+                           **PLOTLY_LAYOUT)
+        st.plotly_chart(figp, use_container_width=True)
+
+        swing_dir = "upswing" if fib["up_swing"] else "downswing"
+        with st.expander("❓ Fibonacci + support/resistance — how to use"):
+            st.markdown(f"""
+Dominant swing detected: **{swing_dir}** from ${fib['swing_low']:,.2f} to ${fib['swing_high']:,.2f}.
+
+- **Fibonacci retracements** — how much of a move typically gets "given back": 0.382/0.5 = shallow (strong trend), **0.618 = the golden pocket** where healthy pullbacks end, 0.786 = last defence.
+- **Support/resistance** (cyan/purple lines) — price zones where swing pivots *clustered*; the touch count shows how battle-tested each level is. Fib level + S/R level + your stop all in one zone = a level that actually matters.
+""")
+
+        # ---- 🧠 Model breakdown -----------------------------------------------------
         st.markdown("### 🧠 Model breakdown")
         last = comp.iloc[-1]
-        sub = last[["trend", "momentum", "bxtrender", "macd", "rsi", "meanrev", "volume"]]
+        sub = last[["trend", "momentum", "bxtrender", "macd", "rsi",
+                    "meanrev", "volume"]]
         sub_df = pd.DataFrame(
             {"model": [str(k) for k in sub.index],
              "score": [float(xv) for xv in sub.values]}).set_index("model")
         st.bar_chart(sub_df, height=220)
         with st.expander("❓ What does each model measure?"):
             st.markdown("""
-- **trend** — price vs its 50 & 200-day averages + golden/death cross. The big picture direction.
-- **momentum** — the classic academic "12-1" factor: how the stock did over the past year excluding the last month. Winners tend to keep winning.
-- **macd** — momentum of momentum; catches acceleration and deceleration earlier than trend.
-- **rsi** — is buying or selling pressure dominant right now (above/below 50), with a small fade at extreme readings.
-- **meanrev** — Bollinger z-score: how stretched the price is from its 20-day average. Stretched rubber bands snap back.
-- **volume** — do volume surges confirm the price direction? Moves without volume are suspect.
-- **bxtrender** — double-smoothed momentum (RSI of an EMA spread, T3-filtered): direction from the long oscillator, timing from the short one. Less lag than MACD.
+- **trend** — price vs 50 & 200-day averages + golden/death cross. The big picture.
+- **momentum** — the academic "12-1" factor: past-year performance excluding the last month. Winners keep winning.
+- **bxtrender** — double-smoothed momentum (RSI of an EMA spread, T3-filtered). Less lag than MACD.
+- **macd** — momentum of momentum; catches acceleration early.
+- **rsi** — which side is dominant right now (above/below 50), fading extremes.
+- **meanrev** — Bollinger z-score; stretched rubber bands snap back.
+- **volume** — do volume surges confirm the move? Moves without volume are suspect.
 
-Bars pointing the **same way** = high-quality signal. Bars fighting each other = chop — usually a NO TRADE.
+Bars pointing the same way = quality signal. Bars fighting = chop = usually NO TRADE.
 """)
 
 # ===========================================================================
@@ -420,11 +510,19 @@ with tab_screener:
     if st.button("Run scan", type="primary"):
         with st.spinner(f"Downloading & scoring {len(universe)} tickers…"):
             data = fetch_many(universe, period="2y")
+            spy_ret3m = None
+            try:
+                spy = fetch_history("SPY", period="1y")
+                spy_ret3m = float(spy["Close"].pct_change(63).iloc[-1] * 100)
+            except Exception:
+                pass
             rows = []
             for sym, dfr in data.items():
                 try:
                     snap = latest_snapshot(dfr)
                     snap["ticker"] = sym
+                    if spy_ret3m is not None and snap.get("ret_3m") is not None:
+                        snap["rs_vs_spy"] = round(snap["ret_3m"] - spy_ret3m, 1)
                     rows.append(snap)
                 except Exception:
                     continue
@@ -454,12 +552,12 @@ with tab_screener:
             use_container_width=True, height=560)
         with st.expander("❓ How to read this table"):
             st.markdown("""
-- **score** — the fused output of all six models, −1 (max bearish) to +1 (max bullish), dampened in volatility storms. ≥ +0.25 = BUY zone, ≤ −0.25 = SELL zone.
-- **trend / momentum / macd / rsi_score / meanrev** — each model's individual vote, so you can see *who* is driving the score.
-- **atr** — the average daily range in $; bigger = wilder stock = smaller position for the same risk.
-- **ret_1m / ret_3m** — recent performance for context.
+- **score** — the fused 7-model output, −1 to +1, dampened in vol storms. ≥ +0.25 BUY zone, ≤ −0.25 SELL zone.
+- **rs_vs_spy** — 3-month return minus SPY's: is this name actually *beating the market*, or just floating with it? Institutions buy leaders, not laggards.
+- **off_52w_high** — distance from the 52-week high. Research says strength near highs (0 to −10%) keeps working; −40% "bargains" usually aren't.
+- **atr** — daily range in $; wilder stock = smaller position for the same risk.
 
-Workflow: scan → pick the extremes → take them to the **🎯 Trade desk** for the full verdict with Monte Carlo odds. Never trade off the scan alone.
+Workflow: scan → pick extremes → **🎯 Trade desk** for the full verdict. Never trade off the scan alone.
 """)
 
 # ===========================================================================
@@ -494,25 +592,70 @@ with tab_backtest:
                                      name="Buy & Hold",
                                      line=dict(width=1.5, dash="dot",
                                                color="#8b98a5")))
-            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
                               yaxis_title="Equity $", **PLOTLY_LAYOUT)
             st.plotly_chart(fig, use_container_width=True)
 
-            with st.expander("❓ What do these metrics mean?"):
+            # Drawdown + rolling Sharpe
+            dd = res.equity / res.equity.cummax() - 1
+            roll = res.equity.pct_change().rolling(63)
+            rsharpe = (roll.mean() / roll.std() * np.sqrt(252)).dropna()
+            cA, cB = st.columns(2)
+            with cA:
+                figd = go.Figure(go.Scatter(x=dd.index, y=dd * 100,
+                                            fill="tozeroy",
+                                            line=dict(color="#ef4444"),
+                                            name="Drawdown %"))
+                figd.update_layout(height=280, title="Drawdown %",
+                                   margin=dict(l=10, r=10, t=40, b=10),
+                                   **PLOTLY_LAYOUT)
+                st.plotly_chart(figd, use_container_width=True)
+            with cB:
+                figs2 = go.Figure(go.Scatter(x=rsharpe.index, y=rsharpe,
+                                             line=dict(color="#22d3ee"),
+                                             name="Rolling Sharpe"))
+                figs2.add_hline(y=0, line_color="#2a3644")
+                figs2.update_layout(height=280, title="Rolling Sharpe (3m)",
+                                    margin=dict(l=10, r=10, t=40, b=10),
+                                    **PLOTLY_LAYOUT)
+                st.plotly_chart(figs2, use_container_width=True)
+
+            # Monthly returns heatmap
+            mrets = res.equity.resample("ME").last().pct_change().dropna()
+            if len(mrets) >= 6:
+                hm = pd.DataFrame({
+                    "year": mrets.index.year,
+                    "month": mrets.index.strftime("%b"),
+                    "ret": mrets.values * 100})
+                order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                pivot = hm.pivot_table(index="year", columns="month",
+                                       values="ret").reindex(columns=order)
+                fighm = go.Figure(go.Heatmap(
+                    z=pivot.values, x=pivot.columns,
+                    y=[str(y) for y in pivot.index],
+                    colorscale="RdYlGn", zmid=0,
+                    text=np.round(pivot.values, 1),
+                    texttemplate="%{text}", showscale=False))
+                fighm.update_layout(height=90 + 45 * len(pivot),
+                                    title="Monthly returns % (strategy)",
+                                    margin=dict(l=10, r=10, t=40, b=10),
+                                    **PLOTLY_LAYOUT)
+                st.plotly_chart(fighm, use_container_width=True)
+
+            with st.expander("❓ What do these metrics & charts mean?"):
                 st.markdown("""
-- **CAGR %** — compound annual growth rate; the "interest rate" your strategy earned.
-- **Sharpe** — return per unit of risk. Below 0.5 = weak, ~1 = decent, 2+ = suspicious (check for bugs 😉).
-- **Sortino** — like Sharpe but only punishes *downside* wiggle. More honest for asymmetric strategies.
-- **Max Drawdown %** — worst peak-to-valley loss. The number that decides whether you'd actually *survive* running this.
-- **Win Rate** — % of winning trades. Low win rate is fine with big winners; the pair to watch is win rate × risk/reward.
-- **vs Buy & Hold** — the brutal benchmark. A signal earns its life by better *risk-adjusted* numbers (Sharpe, drawdown), not necessarily more raw profit.
+- **CAGR** — the "interest rate" your strategy earned. **Sharpe** — return per unit of risk (~1 decent, 2+ = check for bugs 😉). **Sortino** — punishes only downside wiggle. **Max Drawdown** — worst peak-to-valley; the number that decides if you'd *survive* running this.
+- **Drawdown chart** — how deep and how *long* the underwater periods were. Long flat red = the psychological killer.
+- **Rolling Sharpe** — is the edge steady or was it one lucky quarter?
+- **Monthly heatmap** — seasonality and consistency at a glance. A good system is boringly green, not one giant month.
 """)
 
             st.markdown("#### Walk-forward check (4 sequential folds)")
             st.dataframe(walk_forward(df, cfg), use_container_width=True)
             with st.expander("❓ Why walk-forward matters"):
                 st.markdown("""
-The same rules re-run on 4 **separate, sequential periods**. A real edge shows up in most folds; a curve-fit illusion shines in one period and dies in the rest. This is the single best overfitting detector available to a retail quant — institutional desks live by it.
+The same rules re-run on 4 separate sequential periods. A real edge shows in most folds; a curve-fit illusion shines in one and dies in the rest. The single best overfitting detector available to a retail quant.
 """)
 
             if len(res.trades):
@@ -540,27 +683,31 @@ with tab_options:
             ts = atm_term_structure(chain)
             atm_iv = float(ts["iv"].iloc[0]) if len(ts) else None
             skew = skew_25(chain)
-            # Black-Scholes expected move: ~0.8 * S * IV * sqrt(T)
+            pcr = put_call_ratio(chain)
+            near_exp = sorted(chain["expiry"].unique())[0]
+            mp = max_pain(chain, near_exp)
             exp_move = None
             if atm_iv:
                 t_yrs = float(ts["dte"].iloc[0]) / 365.0
                 exp_move = 0.8 * spot * (atm_iv / 100) * np.sqrt(t_yrs)
 
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("Spot", f"${spot:,.2f}")
-            m2.metric("ATM IV (near expiry)",
-                      f"{atm_iv:.1f}%" if atm_iv else "—")
-            m3.metric("Expected move by expiry",
-                      f"±${exp_move:,.2f}" if exp_move else "—")
-            m4.metric("Skew (95P − 105C)",
-                      f"{skew:+.1f} pts" if skew is not None else "—")
-            m5.metric("Quotes used", f"{len(chain):,}")
+            m2.metric("ATM IV", f"{atm_iv:.1f}%" if atm_iv else "—")
+            m3.metric("Expected move", f"±${exp_move:,.2f}" if exp_move else "—")
+            m4.metric("Skew (95P−105C)",
+                      f"{skew:+.1f}" if skew is not None else "—")
+            m5.metric("Put/Call OI ratio", pcr if pcr is not None else "—")
+            m6.metric(f"Max pain ({near_exp[5:]})",
+                      f"${mp:,.0f}" if mp else "—")
 
             with st.expander("❓ What do these numbers mean?"):
                 st.markdown(f"""
-- **ATM IV** — the market's own forecast of {opt_tkr}'s volatility, backed by real money. High IV = the market expects fireworks.
-- **Expected move** — the Black-Scholes straddle approximation (≈ 0.8 × price × IV × √time): how far the market prices {opt_tkr} to move by the nearest expiry, in dollars. Your target inside this range = realistic; far outside = you're betting against the options market.
-- **Skew** — how much more expensive downside puts are vs upside calls. Positive & large = crash insurance in demand (fear). Near zero or negative = complacency or upside chase.
+- **ATM IV** — the market's own volatility forecast, backed by real money.
+- **Expected move** — Black-Scholes straddle approximation (≈ 0.8 × price × IV × √time): how far the market prices {opt_tkr} to move by the nearest expiry. Targets outside it = betting against the options market.
+- **Skew** — downside puts vs upside calls. Large positive = crash insurance in demand.
+- **Put/Call OI ratio** — total put open interest ÷ calls. Extremes are contrarian: >1.2 = fear (often near bottoms), <0.6 = greed.
+- **Max pain** — the strike where option *holders* lose the most at expiry. Price often gravitates toward it into expiration week (dealers hedging), a real but modest effect.
 """)
 
             strikes, dtes, grid = build_surface(chain)
@@ -580,10 +727,7 @@ with tab_options:
                 st.plotly_chart(fig, use_container_width=True)
                 with st.expander("❓ How to read the 3D surface"):
                     st.markdown("""
-Every point = the implied volatility of one option (strike × days to expiry). What pros look for:
-- **The smile/smirk** (curve across strikes): deep OTM options cost more vol — the market pays up for tail protection. A steep left wing = crash fear.
-- **The term slope** (across expiries): upward = calm now, uncertainty later (normal). **Inverted** = the market is bracing for a near-term event (earnings, Fed, war).
-- **Bumps** at specific expiries = event risk priced exactly there. Find the bump, find the catalyst date.
+Every point = one option's implied vol (strike × expiry). Pros look for: the **smile/smirk** across strikes (steep left wing = crash fear), the **term slope** across expiries (inverted = near-term event fear), and **bumps** at specific expiries = event risk priced exactly there.
 """)
 
             colA, colB = st.columns(2)
@@ -598,8 +742,7 @@ Every point = the implied volatility of one option (strike × days to expiry). W
                         x=s.index, y=s.values, mode="lines+markers",
                         name="Puts" if side == "P" else "Calls",
                         line=dict(color=color)))
-                figs.add_vline(x=spot, line_dash="dot",
-                               annotation_text="spot")
+                figs.add_vline(x=spot, line_dash="dot", annotation_text="spot")
                 figs.update_layout(height=360, xaxis_title="Strike",
                                    yaxis_title="IV %",
                                    margin=dict(l=10, r=10, t=30, b=10),
@@ -630,11 +773,10 @@ Every point = the implied volatility of one option (strike × days to expiry). W
                          use_container_width=True, height=380)
             with st.expander("❓ Greeks cheat-sheet"):
                 st.markdown("""
-Black-Scholes sensitivities — what moves your option's price:
-- **Delta** — $ change per $1 move in the stock. Also ≈ the market's probability the option expires in the money.
-- **Gamma** — how fast delta itself changes. High gamma = the option's behaviour flips quickly near the strike.
-- **Vega** — $ change per 1-point change in IV. Buying high-IV options = paying up; if IV collapses (e.g. after earnings), vega is how much you bleed.
-- **Theta** — $ lost per day from time decay. The rent you pay for holding the option.
+- **Delta** — $ change per $1 stock move; also ≈ probability of expiring in the money.
+- **Gamma** — how fast delta changes; high gamma = behaviour flips fast near the strike.
+- **Vega** — $ change per IV point; post-earnings IV crush is vega bleeding.
+- **Theta** — $ lost per day to time decay; the rent you pay to hold.
 
 Data ~15 min delayed (Yahoo). Educational, not advice.
 """)
@@ -671,5 +813,5 @@ with tab_sizing:
                     f"account).")
             with st.expander("❓ Why size by risk instead of by dollars?"):
                 st.markdown("""
-Buying "$1,000 of each stock" means a calm stock and a wild stock give you totally different risk. Sizing by **risk** (account % ÷ stop distance) equalises it: every trade can hurt you the same, small, survivable amount. With a $5,000 account, ruin-avoidance *is* the strategy — a 50% drawdown needs a 100% gain just to get back to even. Professional desks size everything this way.
+Buying "$1,000 of each stock" gives a calm stock and a wild stock totally different risk. Sizing by **risk** (account % ÷ stop distance) equalises it. With a small account, ruin-avoidance *is* the strategy — a 50% drawdown needs +100% just to break even. For the mathematically optimal size per trade, see the **Kelly** number in the Trade desk's Monte Carlo section — and then use half of it, like the pros.
 """)
