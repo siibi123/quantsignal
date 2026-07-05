@@ -40,6 +40,7 @@ class BTConfig:
     time_stop_dip: int = 10
     regime_filter: bool = True      # longs only above SMA200
     vol_target: bool = True         # inverse-vol position scaling
+    bars_per_year: int = 252        # 1638 hourly, 52 weekly, 12 monthly
 
 
 @dataclass
@@ -61,13 +62,14 @@ def _hurst_quick(close: pd.Series, max_lag: int = 80) -> float:
                          0.0, 1.0))
 
 
-def _metrics(equity: pd.Series, trades: pd.DataFrame, bh: pd.Series) -> dict:
+def _metrics(equity: pd.Series, trades: pd.DataFrame, bh: pd.Series,
+             bpy: int = 252) -> dict:
     rets = equity.pct_change().dropna()
-    n_years = max(len(equity) / 252, 1e-9)
+    n_years = max(len(equity) / bpy, 1e-9)
     cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1 / n_years) - 1
-    sharpe = (rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0.0
+    sharpe = (rets.mean() / rets.std() * np.sqrt(bpy)) if rets.std() > 0 else 0.0
     downside = rets[rets < 0].std()
-    sortino = (rets.mean() / downside * np.sqrt(252)) if downside and downside > 0 else 0.0
+    sortino = (rets.mean() / downside * np.sqrt(bpy)) if downside and downside > 0 else 0.0
     dd = (equity / equity.cummax() - 1).min()
     wins = (trades["pnl"] > 0).sum() if len(trades) else 0
     scr = (trades["pnl"].abs() < trades["pnl"].abs().mean() * 0.1).sum() if len(trades) else 0
@@ -257,7 +259,7 @@ def run_backtest(df: pd.DataFrame, cfg: BTConfig = BTConfig()) -> BTResult:
     bh = pd.Series(cfg.starting_cash / c_[0] * c_[1:], index=idx[1:],
                    name="buy_hold")
     trades = pd.DataFrame(trade_rows)
-    return BTResult(equity, bh, trades, _metrics(equity, trades, bh), mode)
+    return BTResult(equity, bh, trades, _metrics(equity, trades, bh, cfg.bars_per_year), mode)
 
 
 def walk_forward(df: pd.DataFrame, cfg: BTConfig = BTConfig(),

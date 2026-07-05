@@ -14,17 +14,29 @@ from quant.backtest import BTConfig, run_backtest, walk_forward
 from quant.bxtrender import (bxtrender, detect_divergence, event_study,
                              weekly_alignment)
 from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
+from quant.events import equity_risk_gauge, fetch_macro_markets
 from quant.flow import gex_profile, gex_summary, unusual_flow
 from quant.seasonality import fundamental_snapshot, monthly_seasonality
 from quant.levels import fib_levels, hurst
+from quant.live import live_quote, market_status, patch_live_bar
 from quant.journal import (journal_from_csv, journal_to_csv, load_journal,
                            mark_to_market, record_plan, save_journal)
+from quant.garch_pairs import garch_forecast, pairs_analysis
 from quant.montecarlo import cone, simulate, trade_odds
+from quant.portfolio import build_prices, optimize
+from quant.runner import run_machine
+from quant.risk import (correlation_heat, kelly_ladder, portfolio_var,
+                        position_risk, risk_of_ruin)
 from quant.rl_lab import (MDM_COLORS, MDM_STYLES, market_dynamics,
                           prudex_scores, train_agent)
+from quant.opt_edge import (iv_richness, move_vs_model, realized_vol,
+                            suggest_structure, vrp)
 from quant.options import (atm_term_structure, bs_greeks, build_surface,
                            fetch_chains, max_pain, put_call_ratio, skew_25)
 from quant.signals import BUY_TH, SELL_TH, atr, composite, latest_snapshot
+from quant.timeframes import TF_LABELS, fetch_tf, tf_meta
+from quant.validation import (bootstrap_cagr, deflated_sharpe,
+                              haircut_pvalue, permutation_test)
 from quant.verdict import analyze
 
 st.set_page_config(page_title="QuantSignal", page_icon="📈", layout="wide")
@@ -149,16 +161,86 @@ Educational tool, not financial advice.</p>
 <span class="chip">Max pain</span><span class="chip">Walk-forward</span>
 </div>
 ''', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# LIVE mode — one press arms a panel; it then self-refreshes on this pulse
+# ---------------------------------------------------------------------------
+ms = market_status()
+lc1, lc2, lc3 = st.columns([1.1, 1, 3])
+live_on = lc1.toggle("🔴 LIVE mode", value=False, key="live_on",
+                     help="Armed panels (watchlist, Trade desk, Runner, "
+                          "Track record) auto-refresh with live prices.")
+live_every = lc2.selectbox("Pulse", [15, 30, 60, 120], index=1,
+                           key="live_every",
+                           format_func=lambda s: f"every {s}s")
+LIVE_EVERY = live_every if live_on else None
+lc3.markdown(f"<div class='regime-badge'>{ms['emoji']} {ms['label']} · "
+             f"{ms['detail']} · {ms['et_time']}</div>",
+             unsafe_allow_html=True)
+
+
+@st.fragment(run_every=LIVE_EVERY)
+def _watchlist_strip():
+    from datetime import datetime as _dt
+    syms = ["SPY", "QQQ", "^VIX"]
+    armed = st.session_state.get("desk_params", {}).get("tkr")
+    if armed and armed not in syms:
+        syms.append(armed)
+    cols = st.columns(len(syms) + 1)
+    for col, s in zip(cols, syms):
+        q = live_quote(s)
+        if q:
+            col.metric(s.replace("^", ""), f"{q['price']:,.2f}",
+                       delta=f"{q['chg_pct']:+.2f}%")
+        else:
+            col.metric(s.replace("^", ""), "—")
+    cols[-1].caption(f"{'🔴 LIVE' if LIVE_EVERY else '⏸ static'} · "
+                     f"updated {_dt.now().strftime('%H:%M:%S')}")
+
+
+_watchlist_strip()
+
+st.session_state.setdefault("memory", {})
+
+
+def _remember(section: str, payload: dict):
+    st.session_state["memory"][section] = payload
+
+
+def _memory_chips():
+    mem = st.session_state.get("memory", {})
+    if not mem:
+        return
+    bits = []
+    d = mem.get("desk")
+    if d:
+        bits.append(f"🎯 {d['ticker']}: {d['verdict']} ({d['conviction']})")
+    o = mem.get("options")
+    if o:
+        bits.append(f"🌋 {o['ticker']}: {o.get('vol_state','')[:12]}…")
+    e = mem.get("events")
+    if e:
+        bits.append(f"🌐 macro: {e['label']}")
+    bt = mem.get("backtest")
+    if bt:
+        bits.append(f"🧪 {bt['ticker']}: {bt['mode']} Sharpe {bt['sharpe']}")
+    if bits:
+        st.caption("🧠 **Session memory (tabs share this):** " +
+                   "  ·  ".join(bits))
+
+
+_memory_chips()
 st.write("")
 
 PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
                      plot_bgcolor="rgba(0,0,0,0)",
                      font=dict(family="Inter", color="#e6edf3"))
 
-(tab_master, tab_journal, tab_desk, tab_screener, tab_backtest, tab_options,
- tab_rl, tab_sizing) = st.tabs(
-    ["🧬 Alpha engine", "📒 Track record", "🎯 Trade desk", "🔍 Screener",
-     "🧪 Backtest", "🌋 Options / IV surface", "🤖 RL lab", "💰 Position size"]
+(tab_master, tab_journal, tab_runner, tab_desk, tab_screener, tab_backtest,
+ tab_options, tab_pp, tab_events, tab_rl, tab_sizing) = st.tabs(
+    ["🧬 Alpha engine", "📒 Track record", "⚙️ Runner", "🎯 Trade desk",
+     "🔍 Screener", "🧪 Backtest", "🌋 Options / IV surface",
+     "⚖️ Portfolio & Pairs", "🌐 Event radar", "🤖 RL lab", "💰 Position size"]
 )
 
 SIGNAL_COLORS = {"BUY": "#10b981", "SELL": "#ef4444", "HOLD": "#8a8a8a"}
@@ -300,97 +382,296 @@ with tab_journal:
                "mechanically on real daily bars (first touch; stop wins ties). "
                "This is how a strategy earns trust before real money.")
 
-    jj = load_journal()
-    n_pos = len(jj["positions"])
-
-    ctop = st.columns([1, 1, 2])
-    if n_pos:
-        ctop[0].download_button("⬇️ Export journal (CSV)",
-                                journal_to_csv(jj), "quantsignal_journal.csv",
-                                "text/csv")
-    up = ctop[1].file_uploader("Restore from CSV", type="csv",
-                               label_visibility="collapsed")
-    if up is not None:
-        jj = journal_from_csv(up.getvalue().decode())
-        save_journal(jj)
-        st.success(f"Journal restored — {len(jj['positions'])} positions.")
+    @st.fragment(run_every=LIVE_EVERY)
+    def _journal_live():
+        jj = load_journal()
         n_pos = len(jj["positions"])
-    ctop[2].info("⚠️ Free hosting wipes local files on redeploy — export "
-                 "after every session. The CSV is your custody.")
 
-    if not n_pos:
-        st.info("No positions recorded yet. Run the 🧬 Alpha engine and hit "
-                "**Record this plan** — the clock starts there.")
-    else:
-        with st.spinner("Marking positions to market…"):
-            mtm = mark_to_market(jj, lambda t: fetch_history(t, period="1y"))
-            save_journal(jj)   # persist any auto-closed stops/targets
+        ctop = st.columns([1, 1, 2])
+        if n_pos:
+            ctop[0].download_button("⬇️ Export journal (CSV)",
+                                    journal_to_csv(jj), "quantsignal_journal.csv",
+                                    "text/csv")
+        up = ctop[1].file_uploader("Restore from CSV", type="csv",
+                                   label_visibility="collapsed")
+        if up is not None:
+            jj = journal_from_csv(up.getvalue().decode())
+            save_journal(jj)
+            st.success(f"Journal restored — {len(jj['positions'])} positions.")
+            n_pos = len(jj["positions"])
+        ctop[2].info("⚠️ Free hosting wipes local files on redeploy — export "
+                     "after every session. The CSV is your custody.")
 
-        if mtm.get("data_issues"):
-            st.warning("Data issues: " + ", ".join(mtm["data_issues"]))
+        if not n_pos:
+            st.info("No positions recorded yet. Run the 🧬 Alpha engine and hit "
+                    "**Record this plan** — the clock starts there.")
+        else:
+            with st.spinner("Marking positions to market…"):
+                mtm = mark_to_market(
+                jj, lambda t: patch_live_bar(fetch_history(t, period="1y"), t))
+                save_journal(jj)   # persist any auto-closed stops/targets
 
-        s = mtm["stats"]
-        head = st.columns(6)
-        head[0].metric("Paper equity", f"${s.get('Equity $', 0):,.0f}")
-        head[1].metric("Total return", f"{s.get('Total return %', 0)}%")
-        head[2].metric("vs SPY", f"{s.get('Alpha vs SPY %', '—')}%"
-                       if "Alpha vs SPY %" in s else "—")
-        head[3].metric("Live Sharpe", s.get("Sharpe (live)", "—"))
-        head[4].metric("Hit rate", f"{s.get('Hit rate %', '—')}%"
-                       if "Hit rate %" in s else "—")
-        head[5].metric("Open heat", f"${s.get('Heat (risk if all stops hit) $', 0):,.0f}")
+            if mtm.get("data_issues"):
+                st.warning("Data issues: " + ", ".join(mtm["data_issues"]))
 
-        meta1, meta2, meta3 = st.columns(3)
-        meta1.caption(f"Inception: {jj['meta'].get('inception', '—')}")
-        meta2.caption(f"Model: {jj['meta'].get('version', '—')}")
-        meta3.caption(f"Positions: {s.get('Open / Closed', '—')} "
-                      f"(open/closed) · Max DD {s.get('Max DD %', '—')}%")
+            s = mtm["stats"]
+            head = st.columns(6)
+            head[0].metric("Paper equity", f"${s.get('Equity $', 0):,.0f}")
+            head[1].metric("Total return", f"{s.get('Total return %', 0)}%")
+            head[2].metric("vs SPY", f"{s.get('Alpha vs SPY %', '—')}%"
+                           if "Alpha vs SPY %" in s else "—")
+            head[3].metric("Live Sharpe", s.get("Sharpe (live)", "—"))
+            head[4].metric("Hit rate", f"{s.get('Hit rate %', '—')}%"
+                           if "Hit rate %" in s else "—")
+            head[5].metric("Open heat", f"${s.get('Heat (risk if all stops hit) $', 0):,.0f}")
 
-        if len(mtm["equity"]) > 1:
-            fige = go.Figure()
-            fige.add_trace(go.Scatter(x=mtm["equity"].index, y=mtm["equity"],
-                                      name="Portfolio",
-                                      line=dict(color="#10b981", width=2)))
-            if len(mtm["bench"]) > 1:
-                fige.add_trace(go.Scatter(x=mtm["bench"].index, y=mtm["bench"],
-                                          name="SPY (same $)",
-                                          line=dict(color="#8b98a5", width=1.5,
-                                                    dash="dot")))
-            fige.update_layout(height=380, yaxis_title="Equity $",
-                               margin=dict(l=10, r=10, t=30, b=10),
-                               **PLOTLY_LAYOUT)
-            st.plotly_chart(fige, use_container_width=True)
+            meta1, meta2, meta3 = st.columns(3)
+            meta1.caption(f"Inception: {jj['meta'].get('inception', '—')}")
+            meta2.caption(f"Model: {jj['meta'].get('version', '—')}")
+            meta3.caption(f"Positions: {s.get('Open / Closed', '—')} "
+                          f"(open/closed) · Max DD {s.get('Max DD %', '—')}%")
 
-        st.markdown("#### Blotter")
-        st.dataframe(mtm["blotter"], use_container_width=True,
-                     hide_index=True, height=360)
-
-        if len(mtm["monthly"]):
-            st.markdown("#### Monthly returns")
-            st.dataframe(mtm["monthly"], use_container_width=True,
-                         hide_index=True)
-
-        with st.expander("❓ Why this is the feature that matters most"):
-            st.markdown("""
-Backtests can be (accidentally) curve-fit. A **forward paper record** cannot: the timestamps prove every pick was made *before* the outcome. This is exactly how allocators evaluate new managers — months of verified process before a dollar moves. Rules of the game: record every plan (no cherry-picking), let stops do their job, export the CSV after each session, and judge nothing before ~20 closed trades. If after months the record shows an edge over SPY — it's real. If it doesn't — the site just saved you real money.
+            # ---- 🛡️ RISK DESK — live book risk, the quant way -------------
+            open_b = mtm["blotter"][mtm["blotter"]["status"] == "OPEN"]
+            if len(open_b):
+                st.markdown("### 🛡️ Risk desk — the open book")
+                poss = [{"ticker": r["ticker"], "shares": int(r["shares"]),
+                         "entry": float(r["entry"]), "stop": float(r["stop"])}
+                        for _, r in open_b.iterrows()]
+                rets_map = {}
+                for p_ in poss:
+                    try:
+                        h_ = fetch_history(p_["ticker"], period="1y")
+                        rets_map[p_["ticker"]] = \
+                            h_["Close"].pct_change().dropna()
+                    except Exception:
+                        continue
+                acct_ = float(jj["meta"].get("account", 5000.0))
+                pv = portfolio_var(poss, rets_map, acct_)
+                ch = correlation_heat(poss, rets_map, acct_)
+                rk1, rk2, rk3, rk4, rk5 = st.columns(5)
+                if pv:
+                    rk1.metric("1-day VaR 95%",
+                               f"${pv['VaR_$']:,.0f} ({pv['VaR_%']}%)",
+                               help="On a normal bad day (1 in 20), expect "
+                                    "to lose up to this much.")
+                    rk2.metric("1-day CVaR 95%",
+                               f"${pv['CVaR_$']:,.0f} ({pv['CVaR_%']}%)",
+                               help="When that bad day happens, this is the "
+                                    "AVERAGE loss — the tail number desks "
+                                    "size by.")
+                    rk3.metric("Gross exposure",
+                               f"{pv['gross_exposure_%']}%")
+                if ch:
+                    rk4.metric("Heat: naive → corr-adj",
+                               f"${ch['naive_heat_$']:,.0f} → "
+                               f"${ch['corr_adj_heat_$']:,.0f}")
+                    rk5.metric("Avg pairwise corr", ch["avg_correlation"],
+                               delta="⚠️ crowded book" if ch["warning"]
+                               else "diversified",
+                               delta_color="inverse" if ch["warning"]
+                               else "normal")
+                if ch and ch["warning"]:
+                    st.warning("Your open positions are highly correlated — "
+                               "effectively ONE big trade. A single market "
+                               "move can hit every stop together. Consider "
+                               "trimming or diversifying sectors.")
+                with st.expander("❓ Reading the risk desk"):
+                    st.markdown("""
+- **VaR 95%** — parametric 1-day Value-at-Risk from the actual covariance of your holdings: "on a normal bad day, expect up to this."
+- **CVaR** — the average loss *given* that bad day happened. Desks size by CVaR, not VaR, because tails are where accounts die.
+- **Correlation-adjusted heat** — summing per-position risk pretends positions are independent. When names move together (avg corr > 0.6), your true worst case approaches the naive sum — the diversification you think you have is an illusion. The gap between the numbers = your real diversification benefit.
 """)
+
+            if len(mtm["equity"]) > 1:
+                fige = go.Figure()
+                fige.add_trace(go.Scatter(x=mtm["equity"].index, y=mtm["equity"],
+                                          name="Portfolio",
+                                          line=dict(color="#10b981", width=2)))
+                if len(mtm["bench"]) > 1:
+                    fige.add_trace(go.Scatter(x=mtm["bench"].index, y=mtm["bench"],
+                                              name="SPY (same $)",
+                                              line=dict(color="#8b98a5", width=1.5,
+                                                        dash="dot")))
+                fige.update_layout(height=380, yaxis_title="Equity $",
+                                   margin=dict(l=10, r=10, t=30, b=10),
+                                   **PLOTLY_LAYOUT)
+                st.plotly_chart(fige, use_container_width=True)
+
+            st.markdown("#### Blotter")
+            st.dataframe(mtm["blotter"], use_container_width=True,
+                         hide_index=True, height=360)
+
+            if len(mtm["monthly"]):
+                st.markdown("#### Monthly returns")
+                st.dataframe(mtm["monthly"], use_container_width=True,
+                             hide_index=True)
+
+            with st.expander("❓ Why this is the feature that matters most"):
+                st.markdown("""
+    Backtests can be (accidentally) curve-fit. A **forward paper record** cannot: the timestamps prove every pick was made *before* the outcome. This is exactly how allocators evaluate new managers — months of verified process before a dollar moves. Rules of the game: record every plan (no cherry-picking), let stops do their job, export the CSV after each session, and judge nothing before ~20 closed trades. If after months the record shows an edge over SPY — it's real. If it doesn't — the site just saved you real money.
+    """)
+
+
+    _journal_live()
+
+# ===========================================================================
+# 0c. RUNNER — the trade lifecycle machine
+# ===========================================================================
+with tab_runner:
+    st.subheader("⚙️ Runner — the machine trades it, you read the log")
+    st.caption("Bar-by-bar lifecycle on real history: entries (trend or dip, "
+               "auto-picked by Hurst), scale-outs at +1R and +2R, breakeven "
+               "jumps, chandelier trail, time exits — every event logged with "
+               "the model state and the reason. Ends with today's live "
+               "status and tomorrow's order.")
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    rn_tkr = c1.text_input("Ticker", value="NVDA", key="rn").upper().strip()
+    rn_tf = c2.selectbox("Timeframe", TF_LABELS, index=1, key="rnp")
+    rn_acct = c3.number_input("Account $", 500, 1_000_000, 5000, step=500,
+                              key="rn_acct")
+    rn_mode = c4.selectbox("Mode", ["auto", "trend", "dip"], key="rn_mode")
+
+    if st.button("▶️ Run the machine", type="primary", key="rn_run"):
+        st.session_state["rn_params"] = dict(
+            rn_tkr=rn_tkr, rn_tf=rn_tf, rn_acct=float(rn_acct),
+            rn_mode=rn_mode)
+
+    @st.fragment(run_every=LIVE_EVERY)
+    def _runner_live():
+        if "rn_params" not in st.session_state:
+            return
+        _p = st.session_state["rn_params"]
+        rn_tkr, rn_tf = _p["rn_tkr"], _p.get("rn_tf", "Daily")
+        rn_acct, rn_mode = _p["rn_acct"], _p["rn_mode"]
+        _rm = tf_meta(rn_tf)
+        with st.spinner(f"Replaying every {rn_tf} bar through the models…"):
+            df = fetch_tf(rn_tkr, rn_tf)
+            if rn_tf == "Daily":
+                df = patch_live_bar(df, rn_tkr)
+            if len(df) < _rm["min_bars"]:
+                st.error(f"Need at least ~{_rm['min_bars']} {rn_tf} bars.")
+                return
+            res = run_machine(df, account=float(rn_acct), mode=rn_mode)
+            if "error" in res:
+                st.error(res["error"])
+                return
+
+        # live state card
+        stt = res["state"]
+        if stt["in_position"]:
+            st.markdown(f"""
+            <div class="verdict v-long">
+              <div>
+                <h2>🟢 IN POSITION — {rn_tkr}</h2>
+                <div class="sub">{stt['shares']} shares @ ${stt['entry']:,.2f}
+                 · held {stt['bars_held']} bars · {stt['scaled']} ·
+                 unrealized ${stt['unrealized']:,.0f}</div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:.85rem;opacity:.8">Active stop</div>
+                <div style="font-size:1.6rem;font-weight:800">
+                  ${stt['stop_now']:,.2f}</div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="verdict v-none">
+              <div><h2>⚪ FLAT — {rn_tkr}</h2>
+              <div class="sub">machine mode: {res['mode'].upper()}</div></div>
+            </div>""", unsafe_allow_html=True)
+        st.info(f"**Tomorrow's order:** {stt['tomorrow']}")
+
+        sc = st.columns(len(res["stats"]))
+        for col, (k, v) in zip(sc, res["stats"].items()):
+            col.metric(k, v)
+
+        # price chart with event markers
+        ev = res["events"]
+        figrn = go.Figure()
+        figrn.add_trace(go.Candlestick(
+            x=df.index[-504:], open=df["Open"][-504:], high=df["High"][-504:],
+            low=df["Low"][-504:], close=df["Close"][-504:], name=rn_tkr))
+        if len(ev):
+            ev_plot = ev[pd.to_datetime(ev["date"]).isin(df.index[-504:])]
+            marker_map = [("ENTRY", "triangle-up", "#10b981"),
+                          ("SCALE", "diamond", "#22d3ee"),
+                          ("TARGET", "star", "#6ee7b7"),
+                          ("STOP", "x", "#ef4444"),
+                          ("EXIT", "circle", "#f59e0b")]
+            for key, sym, col_ in marker_map:
+                sub = ev_plot[ev_plot["event"].str.contains(key)]
+                if len(sub):
+                    figrn.add_trace(go.Scatter(
+                        x=pd.to_datetime(sub["date"]), y=sub["price"],
+                        mode="markers", name=key.title(),
+                        marker=dict(symbol=sym, size=11, color=col_,
+                                    line=dict(width=1, color="#0b0f14"))))
+        figrn.update_layout(height=520, xaxis_rangeslider_visible=False,
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            **PLOTLY_LAYOUT)
+        st.plotly_chart(figrn, use_container_width=True)
+
+        st.markdown("#### 📜 The log — every decision, with its reason")
+        if len(ev):
+            st.dataframe(ev.iloc[::-1], use_container_width=True,
+                         hide_index=True, height=420)
+        else:
+            st.info("The machine never found an entry it liked on this "
+                    "ticker — that is a valid (and cheap) outcome.")
+
+        figeq = go.Figure(go.Scatter(x=res["equity"].index, y=res["equity"],
+                                     line=dict(color="#10b981", width=2),
+                                     name="Machine equity"))
+        figeq.update_layout(height=260, yaxis_title="Equity $",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            **PLOTLY_LAYOUT)
+        st.plotly_chart(figeq, use_container_width=True)
+
+        with st.expander("❓ How the machine decides"):
+            st.markdown("""
+**Entry** — trend mode: composite BUY + B-Xtrender rising & positive + above the 200-SMA. Dip mode: RSI(2) < 10 panic *inside the Fibonacci 0.382–0.786 pocket* of an uptrend. Mode auto-picked by the ticker's Hurst exponent.
+
+**The lifecycle** — at **+1R**: sell ⅓, stop jumps to breakeven (the trade can no longer lose). At **+2R**: sell another ⅓, stop jumps to entry+1R (profit is locked). The last third rides a 2.5×ATR chandelier trail as far as the trend goes. Stale unprofitable trades get time-stopped.
+
+**Why scale-outs** — they resolve the eternal "take profit vs let it run" fight by doing both: the win rate rises (thirds get banked), the tail stays open (the runner catches the big moves). It costs a little expectancy vs all-or-nothing in pure trends — and buys a smoother equity curve and a calmer trader. That's usually the right trade.
+""")
+
+    _runner_live()
 
 # ===========================================================================
 # 1. TRADE DESK
 # ===========================================================================
 with tab_desk:
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1.4])
+    c1, c2, c3, c4, c5 = st.columns([1.7, 1, 1, 1, 1.3])
     tkr = c1.text_input("Ticker", value="NVDA", key="desk").upper().strip()
-    account = c2.number_input("Account $", 500, 1_000_000, 5000, step=500)
-    risk_pct = c3.slider("Risk/trade %", 0.5, 3.0, 1.0, 0.25)
-    use_opts = c4.toggle("Include options skew (slower)", value=False)
+    tf = c2.selectbox("Timeframe", TF_LABELS, index=1, key="desk_tf")
+    account = c3.number_input("Account $", 500, 1_000_000, 5000, step=500)
+    risk_pct = c4.slider("Risk/trade %", 0.5, 3.0, 1.0, 0.25)
+    use_opts = c5.toggle("Include options skew (slower)", value=False)
 
     if st.button("Run desk analysis", type="primary", key="deskrun"):
-        with st.spinner("Crunching 7 models, Monte Carlo, vol forecast & levels…"):
-            df = fetch_history(tkr, period="2y")
-            if df.empty or len(df) < 260:
-                st.error(f"Not enough data for {tkr} (need ~1y of history).")
-                st.stop()
+        st.session_state["desk_params"] = dict(
+            tkr=tkr, account=float(account), risk_pct=float(risk_pct),
+            use_opts=bool(use_opts), tf=tf)
+
+    @st.fragment(run_every=LIVE_EVERY)
+    def _desk_live():
+        if "desk_params" not in st.session_state:
+            return
+        _p = st.session_state["desk_params"]
+        tkr, account = _p["tkr"], _p["account"]
+        risk_pct, use_opts = _p["risk_pct"], _p["use_opts"]
+        tf = _p.get("tf", "Daily")
+        _m = tf_meta(tf)
+        with st.spinner(f"Crunching 7 models on {tf} bars…"):
+            df = fetch_tf(tkr, tf)
+            if tf == "Daily":
+                df = patch_live_bar(df, tkr)
+            if df.empty or len(df) < _m["min_bars"]:
+                st.error(f"Not enough {tf} bars for {tkr} "
+                         f"(need ~{_m['min_bars']}).")
+                return
             skew = None
             flow_share = None
             if use_opts:
@@ -421,13 +702,18 @@ with tab_desk:
             kel = kelly(p_win, v["rr"])
 
         # ---- Regime + vol forecast row --------------------------------------
-        rg1, rg2, rg3, rg4 = st.columns([1.6, 1, 1, 1])
+        garch = garch_forecast(df) if tf == "Daily" else {}
+        rg1, rg2, rg3, rg4, rg5 = st.columns([1.6, 1, 1, 1, 1])
         rg1.markdown(f"<div class='regime-badge'>{reg['regime']}</div>"
                      f"<div style='color:#8b98a5;font-size:.85rem;margin-top:6px'>"
                      f"{reg['playbook']}</div>", unsafe_allow_html=True)
         rg2.metric("EWMA vol (annual)", f"{vol['sigma_annual_pct']}%")
         rg3.metric("Expected move (1 day)", f"±${vol['expected_move_1d']:,.2f}")
-        rg4.metric("Hurst exponent", h,
+        rg4.metric("GARCH(1,1) 1-day move",
+                   f"±${garch['move_1d']:,.2f}" if garch else "—",
+                   delta=f"persistence {garch['persistence']}" if garch else None,
+                   delta_color="off")
+        rg5.metric("Hurst exponent", h,
                    delta="trending" if h > 0.55 else
                    "mean-reverting" if h < 0.45 else "random walk",
                    delta_color="off")
@@ -437,6 +723,16 @@ with tab_desk:
 - **EWMA vol (RiskMetrics λ=0.94)** — the industry-standard forecast of tomorrow's volatility, weighting recent days most. The ± number is the *expected* one-day move: intraday wiggles inside it are noise, not signal.
 - **Hurst exponent** — the ticker's memory. >0.5 moves tend to continue (trust trend models), <0.5 they reverse (trust mean-reversion), ≈0.5 random walk.
 """)
+
+        _remember("desk", {"ticker": tkr, "verdict": v["verdict"],
+                           "conviction": v["conviction"],
+                           "garch": garch.get("sigma_annual_pct") if garch else None,
+                           "tf": tf})
+        _mem_o = st.session_state["memory"].get("options")
+        if _mem_o and _mem_o.get("ticker") == tkr:
+            st.caption(f"🧠 From your options run: {_mem_o['vol_state']} · "
+                       f"skew {_mem_o.get('skew','—')} — factored into how "
+                       f"you should express this view (see 🌋 Edge finder).")
 
         # ---- Verdict banner ---------------------------------------------------
         cls = VERDICT_CLASS[v["verdict"]]
@@ -521,6 +817,19 @@ The verdict fuses seven models (trend, momentum, B-Xtrender, MACD, RSI, mean-rev
         mc[5].metric("Half-Kelly (use this)", f"{kel['half_kelly_pct']}%" if
                      kel["edge_positive"] else "—")
 
+        if odds["p_target_first"] + odds["p_stop_first"] > 10:
+            _wr = odds["p_target_first"] / max(
+                odds["p_target_first"] + odds["p_stop_first"], 1e-9)
+            _ror = risk_of_ruin(win_rate=_wr, avg_win=v["rr"], avg_loss=1.0,
+                                risk_per_trade_pct=risk_pct)
+            if _ror:
+                st.caption(f"🛡️ **Risk of a 30% drawdown** trading this "
+                           f"setup repeatedly at {risk_pct}% risk: "
+                           f"**{_ror['prob_of_ruin_%']}%** "
+                           f"({_ror['verdict']}) · expectancy "
+                           f"{_ror['expectancy_R']:+.2f}R per trade "
+                           f"(5,000 simulated careers).")
+
         x = list(range(paths.shape[1]))
         figmc = go.Figure()
         figmc.add_trace(go.Scatter(x=x + x[::-1],
@@ -544,7 +853,7 @@ The verdict fuses seven models (trend, momentum, B-Xtrender, MACD, RSI, mean-rev
                             annotation_text=f"{name} ${lvl:,.2f}",
                             annotation_font_color=color)
         figmc.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
-                            xaxis_title="Trading days ahead",
+                            xaxis_title=f"{tf} bars ahead",
                             yaxis_title="Price $", **PLOTLY_LAYOUT)
         st.plotly_chart(figmc, use_container_width=True)
 
@@ -771,6 +1080,8 @@ The 4-point quality check (1 point each): revenue growth ≥ 10%, gross margin �
 Bars pointing the same way = quality signal. Bars fighting = chop = usually NO TRADE.
 """)
 
+    _desk_live()
+
 # ===========================================================================
 # 2. SCREENER
 # ===========================================================================
@@ -847,7 +1158,7 @@ with tab_backtest:
     st.subheader("Backtest the signal on any ticker")
     c1, c2, c3, c4, c5 = st.columns(5)
     bt_tkr = c1.text_input("Ticker", value="AAPL", key="bt").upper().strip()
-    bt_period = c2.selectbox("History", ["2y", "5y", "10y"], index=1)
+    bt_tf = c2.selectbox("Timeframe", TF_LABELS, index=1, key="bt_tf")
     bt_cash = c3.number_input("Starting cash $", 500, 1_000_000, 5000,
                               step=500)
     bt_risk = c4.slider("Risk per trade %", 0.5, 5.0, 1.0, 0.5)
@@ -857,16 +1168,24 @@ with tab_backtest:
                            value=False, key="bt_short")
 
     if st.button("Run backtest", type="primary", key="btrun"):
-        df = fetch_history(bt_tkr, period=bt_period)
-        if len(df) < 260:
-            st.error("Not enough history — need at least ~1 year.")
+        _bm = tf_meta(bt_tf)
+        df = fetch_tf(bt_tkr, bt_tf)
+        if len(df) < _bm["min_bars"]:
+            st.error(f"Not enough {bt_tf} bars (need ~{_bm['min_bars']}).")
         else:
             cfg = BTConfig(starting_cash=float(bt_cash),
                            risk_per_trade=bt_risk / 100, mode=bt_mode,
-                           allow_short=bt_short)
+                           allow_short=bt_short,
+                           bars_per_year=_bm["bars_per_year"])
             res = run_backtest(df, cfg)
-            st.caption(f"Engine used: **{res.mode_used.upper()}** "
-                       f"{'(picked automatically by Hurst)' if bt_mode == 'auto' else ''}")
+            st.caption(f"Engine: **{res.mode_used.upper()}** on **{bt_tf}** "
+                       f"bars — Sharpe/CAGR annualized with "
+                       f"{_bm['bars_per_year']} bars/yr"
+                       f"{' · mode picked by Hurst' if bt_mode == 'auto' else ''}")
+            _remember("backtest", {"ticker": bt_tkr,
+                                   "mode": res.mode_used,
+                                   "sharpe": res.metrics.get("Sharpe"),
+                                   "tf": bt_tf})
             cols = st.columns(5)
             for col, (k, val) in zip(cols * 2, res.metrics.items()):
                 col.metric(k, val if val is not None else "—")
@@ -965,14 +1284,150 @@ Risk mechanics on every trade:
 
             st.markdown("#### Walk-forward check (4 sequential folds)")
             st.dataframe(walk_forward(df, cfg), use_container_width=True)
+
+            # ---- 🔬 Statistical validation ------------------------------
+            st.markdown("### 🔬 Is this edge REAL? (institutional validation)")
+            st.caption("The tests that separate genuine edges from the "
+                       "thousands you'd find by data-mining. This is what "
+                       "makes a quant trust — or discard — a backtest.")
+            N_TRIALS = 20   # we test ~20 models across the site; be honest about it
+            rets_bt = res.equity.pct_change().dropna()
+            sharpe_bt = res.metrics.get("Sharpe", 0) or 0
+            tstat_bt = (sharpe_bt * np.sqrt(len(rets_bt) / 252)
+                        if len(rets_bt) > 252 else sharpe_bt)
+
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                dsr = deflated_sharpe(sharpe_bt, N_TRIALS, len(rets_bt))
+                if "error" not in dsr:
+                    st.markdown(f"**Deflated Sharpe** — {dsr['verdict']}")
+                    st.caption(f"Observed {dsr['observed_sharpe']} vs "
+                               f"noise-benchmark {dsr['deflated_benchmark_ann']} "
+                               f"· P(real) = {dsr['DSR_probability']}")
+                perm = permutation_test(rets_bt)
+                if "error" not in perm:
+                    st.markdown(f"**Permutation test** — {perm['verdict']}")
+                    st.caption(f"Real Sharpe {perm['actual_sharpe']} vs luck's "
+                               f"95th pct {perm['perm_sharpe_95pct']} · "
+                               f"p = {perm['perm_p_value']}")
+            with vc2:
+                hc = haircut_pvalue(tstat_bt, N_TRIALS)
+                st.markdown(f"**Multiple-testing haircut** — {hc['verdict']}")
+                st.caption(f"Raw p {hc['raw_p']} → after correcting for "
+                           f"{N_TRIALS} models: {hc['bonferroni_p']}")
+                if len(res.trades):
+                    bs = bootstrap_cagr(res.trades["pnl"],
+                                        starting=float(bt_cash))
+                    if "error" not in bs:
+                        st.markdown(f"**Bootstrap 90% CI** — {bs['verdict']}")
+                        st.caption(f"Return CI: {bs['CI90_low_%']}% … "
+                                   f"{bs['median_return_%']}% … "
+                                   f"{bs['CI90_high_%']}%")
+
+            with st.expander("❓ Why these four tests are the real grade"):
+                st.markdown("""
+Anyone can produce a pretty backtest — try 1,000 parameter combos and *one* will look brilliant by pure chance. These tests fight that:
+
+- **Deflated Sharpe** (Bailey & López de Prado 2014) — lowers your Sharpe to account for how many strategies were tried. A Sharpe of 1.5 from testing 20 models is worth far less than 1.5 from testing one.
+- **Multiple-testing haircut** (Harvey, Liu & Zhu 2016) — a t-stat of 2 (the classic "significant") is NOT significant when mined across 20 signals. This corrects it.
+- **Permutation test** — randomly flips the sign of each day's return 500× to build the distribution of "luck." If your real Sharpe isn't clearly above that cloud, you have nothing.
+- **Bootstrap CI** — resamples your trades 1,000× for a 90% confidence band on returns. If the band straddles zero, you genuinely don't know if the strategy works — and that knowledge is worth more than false confidence.
+
+**If a strategy passes all four, it's in rarer air than 99% of what retail traders trade on.** If it fails — the app just saved you from a mirage. That honesty is the highest-value thing this whole site does.
+""")
             with st.expander("❓ Why walk-forward matters"):
                 st.markdown("""
 The same rules re-run on 4 separate sequential periods. A real edge shows in most folds; a curve-fit illusion shines in one and dies in the rest. The single best overfitting detector available to a retail quant.
 """)
 
             if len(res.trades):
+                st.markdown("#### 🗺️ Every trade on the chart — "
+                            "entry, exit, price, reason")
+                tr = res.trades.copy()
+                figtr = go.Figure()
+                figtr.add_trace(go.Candlestick(
+                    x=df.index, open=df["Open"], high=df["High"],
+                    low=df["Low"], close=df["Close"], name=bt_tkr,
+                    increasing_line_color="#2a3644",
+                    decreasing_line_color="#1a222c",
+                    increasing_fillcolor="#2a3644",
+                    decreasing_fillcolor="#1a222c"))
+                figtr.add_trace(go.Scatter(
+                    x=pd.to_datetime(tr["entry_date"]), y=tr["entry"],
+                    mode="markers", name="Entry",
+                    marker=dict(symbol="triangle-up", size=12,
+                                color="#10b981",
+                                line=dict(width=1, color="#0b0f14")),
+                    customdata=tr[["entry"]].values,
+                    hovertemplate="ENTRY @ $%{y:.2f}<br>%{x|%Y-%m-%d}"
+                                  "<extra></extra>"))
+                exit_colors = tr["reason"].map(
+                    {"stop": "#ef4444", "breakeven": "#f59e0b",
+                     "time": "#8b98a5", "signal": "#22d3ee",
+                     "target(rsi)": "#6ee7b7"}).fillna("#e6edf3")
+                figtr.add_trace(go.Scatter(
+                    x=pd.to_datetime(tr["exit_date"]), y=tr["exit"],
+                    mode="markers", name="Exit",
+                    marker=dict(symbol="triangle-down", size=12,
+                                color=exit_colors,
+                                line=dict(width=1, color="#0b0f14")),
+                    customdata=np.stack([tr["reason"], tr["pnl"]], axis=-1),
+                    hovertemplate="EXIT @ $%{y:.2f}<br>reason: %{customdata[0]}"
+                                  "<br>P&L: $%{customdata[1]}<br>%{x|%Y-%m-%d}"
+                                  "<extra></extra>"))
+                # connect entry->exit with a thin win/loss colored line
+                for _, t_ in tr.iterrows():
+                    figtr.add_trace(go.Scatter(
+                        x=[pd.to_datetime(t_["entry_date"]),
+                           pd.to_datetime(t_["exit_date"])],
+                        y=[t_["entry"], t_["exit"]], mode="lines",
+                        line=dict(width=1.2,
+                                  color="rgba(16,185,129,.55)" if t_["pnl"] > 0
+                                  else "rgba(239,68,68,.55)"),
+                        showlegend=False, hoverinfo="skip"))
+                figtr.update_layout(height=520,
+                                    xaxis_rangeslider_visible=False,
+                                    margin=dict(l=10, r=10, t=30, b=10),
+                                    **PLOTLY_LAYOUT)
+                st.plotly_chart(figtr, use_container_width=True)
+                st.caption("▲ green = entry · ▼ exit colored by reason "
+                           "(🔴 stop, 🟠 breakeven, 🔵 signal, 🟢 RSI target, "
+                           "⚪ time) · connecting line green = winner, "
+                           "red = loser. Hover any marker for exact price, "
+                           "date, reason and P&L.")
+
                 st.markdown("#### Trade log")
                 st.dataframe(res.trades, use_container_width=True, height=300)
+
+                # ---- 🛡️ Risk-of-ruin on THIS strategy's actual stats ------
+                wins_ = res.trades[res.trades["pnl"] > 0]["pnl"]
+                losses_ = -res.trades[res.trades["pnl"] < 0]["pnl"]
+                if len(wins_) >= 3 and len(losses_) >= 3:
+                    ror = risk_of_ruin(
+                        win_rate=len(wins_) / len(res.trades),
+                        avg_win=float(wins_.mean()),
+                        avg_loss=float(losses_.mean()),
+                        risk_per_trade_pct=bt_risk)
+                    if ror:
+                        r1, r2, r3, r4 = st.columns(4)
+                        r1.metric("Risk of 30% drawdown",
+                                  f"{ror['prob_of_ruin_%']}%",
+                                  delta=ror["verdict"], delta_color="off")
+                        r2.metric("Payoff ratio (avg W/L)",
+                                  ror["payoff_ratio"])
+                        r3.metric("Expectancy per trade",
+                                  f"{ror['expectancy_R']:+.2f}R")
+                        kl = kelly_ladder(len(wins_) / len(res.trades),
+                                          ror["payoff_ratio"])
+                        r4.metric("Kelly (full/half/¼)",
+                                  f"{kl['full_kelly_%']}/{kl['half_kelly_%']}"
+                                  f"/{kl['quarter_kelly_%']}%"
+                                  if kl["edge"] else "No edge")
+                        st.caption("Risk of ruin: 5,000 Monte Carlo careers "
+                                   "of 200 trades each with THIS strategy's "
+                                   "real win rate and payoff, at your chosen "
+                                   "risk %. The single most important "
+                                   "number on this page.")
 
 # ===========================================================================
 # 4. OPTIONS / IV SURFACE
@@ -1022,6 +1477,77 @@ with tab_options:
 - **Max pain** — the strike where option *holders* lose the most at expiry. Price often gravitates toward it into expiration week (dealers hedging), a real but modest effect.
 """)
 
+
+            # ---- 💡 EDGE FINDER — our models vs the options market ------------
+            st.markdown("### 💡 Edge finder — what WE forecast vs what "
+                        "OPTIONS price")
+            df_u = fetch_history(opt_tkr, period="2y")
+            g_u = garch_forecast(df_u) if len(df_u) > 260 else {}
+            ew_u = ewma_vol(df_u) if len(df_u) > 60 else {}
+            vr = vrp(atm_iv, g_u.get("sigma_annual_pct"),
+                     ew_u.get("sigma_annual_pct")) if atm_iv else {}
+            rich = iv_richness(df_u, atm_iv) if atm_iv else {}
+
+            mem_d = st.session_state.get("memory", {}).get("desk", {})
+            if mem_d.get("ticker") == opt_tkr:
+                direction = mem_d["verdict"]
+                dir_src = f"🧠 from your Trade-desk run (conviction {mem_d['conviction']})"
+            else:
+                try:
+                    v_q = analyze(df_u)
+                    direction = v_q["verdict"]
+                    dir_src = "computed fresh by the 7-model verdict engine"
+                except Exception:
+                    direction, dir_src = "NO TRADE", "unavailable"
+
+            e1, e2, e3, e4 = st.columns(4)
+            if vr:
+                e1.metric("IV vs our vol forecast",
+                          f"{vr['iv']}% vs {vr['forecast_vol']}%",
+                          delta=f"VRP {vr['vrp_pts']:+.1f} pts",
+                          delta_color="off")
+            if rich:
+                e2.metric("IV richness percentile", f"{rich['iv_pctile']}%",
+                          help="Where today's IV sits vs this ticker's own "
+                               "1-year realized-vol distribution.")
+            e3.metric("Directional view", direction, delta=dir_src,
+                      delta_color="off")
+            mvm = {}
+            try:
+                paths_o = simulate(df_u, days=int(ts["dte"].iloc[0]),
+                                   n_paths=2000)
+                mvm = move_vs_model(exp_move, paths_o, spot,
+                                    int(ts["dte"].iloc[0]))
+            except Exception:
+                pass
+            if mvm:
+                e4.metric("Move: market vs model",
+                          f"±${mvm['market_move']} vs ±${mvm['model_move']}",
+                          delta=mvm["read"], delta_color="off")
+
+            if vr:
+                st.markdown(f"**Vol verdict: {vr['state']}**")
+                sug = suggest_structure(direction, vr["state"], chain,
+                                        near_exp, spot, bs_greeks)
+                st.success(f"**🎯 Suggested structure: {sug['name']}**  \n"
+                           f"`{sug['legs']}`  \n{sug['logic']}")
+                _remember("options", {"ticker": opt_tkr,
+                                      "vol_state": vr["state"],
+                                      "skew": skew,
+                                      "atm_iv": atm_iv})
+            with st.expander("❓ Where the options edge actually comes from"):
+                st.markdown("""
+The one durable, research-backed edge in listed options is the **variance risk premium** (Carr & Wu 2009): implied vol *persistently* overprices realized vol, because the world pays up for insurance. Everything in this panel is that comparison, done properly:
+
+- **IV vs our forecast** — ATM implied vol against a GARCH(1,1) + EWMA blend forecast of what vol will actually be. Gap > +4 pts = the market is overpaying for options → *selling* structures have tailwind. Negative gap = options are statistically cheap → *own* them.
+- **IV richness percentile** — level lies, rank doesn't. 90th percentile IV on a boring stock beats 40% IV on a meme stock.
+- **Move: market vs model** — the straddle's expected move against our own 2,000-path Monte Carlo at the same horizon. Disagreement = someone is wrong; the panel tells you which side to take.
+- **The structure suggester** fuses your **directional view** (from the Trade desk — the tabs share memory) with the **vol state** into one concrete trade with delta-picked strikes: bullish+rich IV → put credit spread (get *paid* to be long); bullish+cheap IV → call debit spread (own the move at a discount); no direction+rich IV → iron condor (harvest the premium). Direction, vol, and structure must all agree — that's the whole edge.
+
+⚠️ Honesty: strikes are delta-suggestions from delayed data — always check live quotes, and spreads on Blink need options approval. Defined-risk structures only; never naked short options on a $5K account.
+""")
+
+            st.markdown("---")
 
             # ---- 🐋 Dealer gamma & whale flow ---------------------------------
             st.markdown("### 🐋 Dealer gamma exposure (GEX) & whale flow")
@@ -1153,6 +1679,175 @@ Every point = one option's implied vol (strike × expiry). Pros look for: the **
 Data ~15 min delayed (Yahoo). Educational, not advice.
 """)
 
+
+
+# ===========================================================================
+# 7. PORTFOLIO & PAIRS (awesome-quant: PyPortfolioOpt, statsmodels)
+# ===========================================================================
+with tab_pp:
+    st.subheader("⚖️ Portfolio optimizer")
+    st.caption("PyPortfolioOpt: Max-Sharpe (Markowitz), Min-Vol, and HRP — "
+               "Hierarchical Risk Parity (López de Prado 2016), the robust "
+               "one that needs no return forecasts.")
+    pp_in = st.text_input("Tickers (comma-separated, 3+)",
+                          value="AAPL, MSFT, NVDA, JPM, XOM, GLD",
+                          key="pp_in")
+    pp_acct = st.number_input("Account $", 500, 1_000_000, 5000, step=500,
+                              key="pp_acct")
+    if st.button("Optimize", type="primary", key="pp_run"):
+        tks = tuple(t.strip().upper() for t in pp_in.split(",") if t.strip())
+        with st.spinner("Downloading & optimizing…"):
+            data = fetch_many(tks, period="2y")
+            px = build_prices(data)
+            res = optimize(px, account=float(pp_acct))
+        if "error" in res:
+            st.error(res["error"])
+        else:
+            colw = st.columns(3)
+            for col, key, title in zip(
+                    colw, ("hrp", "max_sharpe", "min_vol"),
+                    ("🌳 HRP (recommended)", "🎯 Max Sharpe", "🛡️ Min Vol")):
+                r = res.get(key, {})
+                with col:
+                    st.markdown(f"**{title}**")
+                    if "error" in r:
+                        st.warning(r["error"])
+                    else:
+                        st.caption(f"exp. ret {r['ret']}% · vol {r['vol']}% "
+                                   f"· Sharpe {r['sharpe']}")
+                        wdf = pd.DataFrame(
+                            {"weight %": {k: round(v * 100, 1)
+                                          for k, v in r["weights"].items()
+                                          if v > 0.001}})
+                        st.dataframe(wdf, use_container_width=True)
+            if res.get("frontier"):
+                figf = go.Figure()
+                figf.add_trace(go.Scatter(
+                    x=[p[0] for p in res["frontier"]],
+                    y=[p[1] for p in res["frontier"]],
+                    mode="lines", name="Efficient frontier",
+                    line=dict(color="#10b981", width=2)))
+                for v_, r_, t_ in res.get("assets", []):
+                    figf.add_trace(go.Scatter(x=[v_], y=[r_], mode="markers+text",
+                                              text=[t_], textposition="top center",
+                                              showlegend=False,
+                                              marker=dict(size=9,
+                                                          color="#8b98a5")))
+                figf.update_layout(height=380, xaxis_title="Volatility %",
+                                   yaxis_title="Expected return %",
+                                   margin=dict(l=10, r=10, t=30, b=10),
+                                   **PLOTLY_LAYOUT)
+                st.plotly_chart(figf, use_container_width=True)
+            if res.get("allocation") and "shares" in res.get("allocation", {}):
+                st.markdown("**🧾 Discrete allocation for your account "
+                            "(HRP weights):**")
+                st.json(res["allocation"])
+            with st.expander("❓ Which one should I use?"):
+                st.markdown("""
+- **HRP** — clusters assets by how they move together and splits risk down the tree. No return forecasts, no unstable matrix math → the weights barely change when the data wiggles. What quants actually deploy.
+- **Max Sharpe** — the textbook optimum, but it *inhales* estimation error: tiny changes in expected returns swing the weights wildly. We cap any single name at 35% to tame it.
+- **Min Vol** — pure defense. Also the sneaky one: low-vol portfolios historically beat their risk-adjusted expectations (the low-volatility anomaly from the Alpha engine).
+""")
+
+    st.markdown("---")
+    st.subheader("🔗 Pairs lab — cointegration (Engle-Granger)")
+    st.caption("Two stocks whose spread is mean-reverting = a market-neutral "
+               "trade: long the cheap one, short the rich one, profit on "
+               "convergence — regardless of market direction.")
+    p1, p2 = st.columns(2)
+    pa = p1.text_input("Ticker A", value="KO", key="pa").upper().strip()
+    pb = p2.text_input("Ticker B", value="PEP", key="pb").upper().strip()
+    if st.button("Test the pair", type="primary", key="pair_run"):
+        with st.spinner("Testing cointegration…"):
+            da = fetch_history(pa, period="2y")
+            db = fetch_history(pb, period="2y")
+            pr = pairs_analysis(da, db)
+        if "error" in pr:
+            st.error(pr["error"])
+        else:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Cointegration p-value", pr["pvalue"],
+                      delta="cointegrated ✓" if pr["cointegrated"]
+                      else "borderline" if pr["borderline"] else "not a pair",
+                      delta_color="off")
+            k2.metric("Hedge ratio", pr["hedge_ratio"],
+                      help=f"1 share {pa} ≈ {pr['hedge_ratio']} shares {pb}")
+            k3.metric("Spread z-score", pr["z"])
+            k4.metric("Half-life (days)", pr["half_life_days"] or "—")
+            st.info(f"**Signal:** {pr['signal']}")
+
+            z = pr["z_series"]
+            figz = go.Figure()
+            figz.add_trace(go.Scatter(x=z.index, y=z, name="spread z",
+                                      line=dict(color="#22d3ee")))
+            for lvl, col_ in ((2, "#ef4444"), (-2, "#10b981"), (0, "#8b98a5")):
+                figz.add_hline(y=lvl, line_dash="dot", line_color=col_)
+            figz.update_layout(height=320, yaxis_title="z-score",
+                               margin=dict(l=10, r=10, t=30, b=10),
+                               **PLOTLY_LAYOUT)
+            st.plotly_chart(figz, use_container_width=True)
+            with st.expander("❓ How to read this"):
+                st.markdown(f"""
+- **p-value ≤ 0.05** — the spread between {pa} and {pb} is statistically mean-reverting (Engle-Granger test). Above 0.10: whatever the chart looks like, it's not a pair.
+- **z-score** — how stretched the spread is right now. The classic playbook: enter at |z| ≥ 2 (long the cheap leg, short the rich leg, sized by the hedge ratio), exit near z = 0.
+- **Half-life** — how fast the spread typically closes half its gap. 5–30 days = tradeable; 100+ days = your capital will die of boredom.
+- Caveat: shorting requires margin; if unavailable, the pair still works as a *relative-value tell* for which of the two names to prefer long.
+""")
+
+
+# ===========================================================================
+# 8. EVENT RADAR — Polymarket odds as information (never traded)
+# ===========================================================================
+with tab_events:
+    st.subheader("🌐 Event radar — real-money macro odds")
+    st.caption("Live Polymarket probabilities on the events that move US "
+               "equities: Fed, recession, CPI, shutdowns, tariffs, elections. "
+               "**Information source only — we read these markets, we never "
+               "trade them.**")
+
+    if st.button("Scan macro markets", type="primary", key="ev_run"):
+        with st.spinner("Reading Polymarket odds…"):
+            ev = fetch_macro_markets()
+        if ev.empty:
+            st.warning("Couldn't reach the Polymarket API right now (or no "
+                       "macro markets matched). Try again in a minute.")
+        else:
+            g = equity_risk_gauge(ev)
+            if g:
+                _remember("events", {"label": g["label"],
+                                     "score": g["score"]})
+                c1, c2 = st.columns([1, 2.5])
+                c1.metric("Equity event gauge", g["label"],
+                          delta=f"score {g['score']:+.2f}",
+                          delta_color="off")
+                with c2:
+                    st.markdown("**Top drivers (real-money odds):**")
+                    for q, p, d in g["drivers"]:
+                        arrow = "🟢" if d > 0 else "🔴"
+                        st.markdown(f"<div class='reason-{'pro' if d>0 else 'con'}'>"
+                                    f"{arrow} {q} — **{p:.0f}%**</div>",
+                                    unsafe_allow_html=True)
+
+            st.markdown("#### All macro/finance markets (by volume)")
+            show = ev.copy()
+            show["yes %"] = show["yes %"].astype(float)
+            st.dataframe(
+                show.style.background_gradient(subset=["yes %"],
+                                               cmap="RdYlGn_r",
+                                               vmin=0, vmax=100),
+                use_container_width=True, height=480, hide_index=True)
+
+            with st.expander("❓ How a stock trader uses prediction markets"):
+                st.markdown("""
+Prediction-market odds are **real-money consensus** — people betting actual dollars, updated in real time. For an equities desk they answer one question: *what event risk is already priced?*
+
+- **Fed cut at 80%** — a cut that happens is a non-event (priced); a *hold* would be the shock. Trade the surprise, not the event.
+- **Recession odds climbing week over week** — tighten stops, favor the defensive side of the screener, respect the regime gate.
+- **Shutdown/tariff odds jumping** — expect vol regime shifts; the Trade Desk's EWMA/GARCH will confirm with a lag, this leads.
+- The 🧲/⛽ GEX regime + this gauge together tell you *both* how the market is positioned and *what* it's positioned for.
+
+Idea credit where due: the repo you sent reads **market skew as crowd positioning** before entering — that's exactly what this tab does, pointed at macro instead of 5-minute BTC. And per your rule: read-only. We inform the stock process; we don't touch the markets themselves.
+""")
 
 # ===========================================================================
 # 6. RL LAB — TradeMaster-inspired

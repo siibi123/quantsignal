@@ -1,39 +1,47 @@
-"""Data layer — fetches OHLCV data from Yahoo Finance with caching."""
+"""Data layer — OHLCV from Yahoo Finance with caching.
+
+Price convention (important for correctness):
+  auto_adjust=False  -> Close is the REAL traded price, matching your broker
+                        and TradingView. This is what we chart, set stops/
+                        targets on, and quote. 'Adj Close' is kept separately
+                        for return calculations that need dividend adjustment.
+"""
 from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# A liquid, tradeable-through-any-US-broker universe (S&P 500 leaders + popular ETFs).
 DEFAULT_UNIVERSE = [
-    # Mega-cap tech
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "AMD", "CRM",
-    # Financials / industrials / energy
     "JPM", "BAC", "GS", "V", "MA", "CAT", "GE", "XOM", "CVX", "COP",
-    # Healthcare / consumer
     "UNH", "LLY", "JNJ", "PG", "KO", "COST", "WMT", "MCD", "NKE", "DIS",
-    # Semis / software
     "TSM", "INTC", "MU", "QCOM", "ORCL", "ADBE", "NOW", "PLTR", "SMCI", "PANW",
-    # ETFs (good for a $5K account — instant diversification)
     "SPY", "QQQ", "IWM", "DIA", "XLE", "XLF", "XLK", "SMH", "GLD", "TLT",
 ]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_history(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    """Download OHLCV history for one ticker. Cached for 1 hour."""
-    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+    """Download OHLCV. Close = real traded price (matches broker/TradingView).
+
+    'AdjClose' kept as an extra column for dividend-adjusted return math.
+    """
+    df = yf.Ticker(ticker).history(period=period, interval=interval,
+                                   auto_adjust=False)
     if df.empty:
         return df
-    df = df.rename(columns=str.title)  # Open/High/Low/Close/Volume
+    df = df.rename(columns=str.title)          # Open/High/Low/Close/Adj Close/Volume
     df.index = pd.to_datetime(df.index).tz_localize(None)
-    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    if "Adj Close" in df.columns:
+        df["AdjClose"] = df["Adj Close"]
+        cols = cols + ["AdjClose"]
+    return df[cols].dropna()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_many(tickers: tuple[str, ...], period: str = "1y") -> dict[str, pd.DataFrame]:
-    """Download several tickers. Returns {ticker: df}. Skips failures silently."""
     out: dict[str, pd.DataFrame] = {}
     for t in tickers:
         try:
