@@ -34,7 +34,8 @@ REGIME_EXPOSURE = {
 def run_master(data: dict[str, pd.DataFrame], spy: pd.DataFrame,
                account: float = 5000.0, risk_pct: float = 1.0,
                max_positions: int = 4, heat_cap_pct: float = 4.0,
-               top_k: int = 8) -> dict:
+               top_k: int = 8, conviction_min: int = 55,
+               aggressive_fill: bool = False) -> dict:
     """Run the whole systematic process. Returns an actionable plan."""
     # 1 — market gate
     reg = regime_quadrant(spy)
@@ -59,16 +60,32 @@ def run_master(data: dict[str, pd.DataFrame], spy: pd.DataFrame,
         v["alpha"] = float(ranks.loc[tkr, "alpha"])
         v["pct_rank"] = int(ranks.loc[tkr, "pct_rank"])
         considered.append(v)
-        if v["verdict"] == "LONG":
+        if v["verdict"] == "LONG" and v["conviction"] >= conviction_min:
             picks.append(v)
     picks.sort(key=lambda x: (-x["conviction"], -x["alpha"]))
     picks = picks[:max_positions]
 
+    # aggressive fill: if the strict gate produced < 2 names, take the top
+    # alpha names anyway at HALF risk, clearly tagged lower-confidence
+    fills = []
+    if aggressive_fill and len(picks) < 2:
+        have = {p["ticker"] for p in picks}
+        for v in considered:
+            if v["ticker"] in have or v["verdict"] == "SHORT":
+                continue
+            if v.get("entry") and v.get("stop") and v["entry"] > v["stop"]:
+                v = dict(v)
+                v["fill"] = True
+                fills.append(v)
+            if len(picks) + len(fills) >= 2:
+                break
+
     # 4 — sizing with portfolio heat cap
     heat_budget = account * heat_cap_pct / 100
     plan_rows, total_cost, total_risk = [], 0.0, 0.0
-    for v in picks:
-        risk_dollars = min(account * risk_pct / 100,
+    for v in picks + (fills if aggressive_fill else []):
+        eff_risk = risk_pct * (0.5 if v.get("fill") else 1.0)
+        risk_dollars = min(account * eff_risk / 100,
                            heat_budget - total_risk)
         if risk_dollars <= 0:
             break
@@ -82,7 +99,7 @@ def run_master(data: dict[str, pd.DataFrame], spy: pd.DataFrame,
         total_risk += shares * stop_dist
         plan_rows.append({
             "ticker": v["ticker"],
-            "action": "BUY",
+            "action": "BUY ½size*" if v.get("fill") else "BUY",
             "shares": shares,
             "entry ~": v["entry"],
             "stop": v["stop"],

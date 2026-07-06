@@ -17,6 +17,7 @@ from quant.bxtrender import (bxtrender, detect_divergence, event_study,
 from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
 from quant.events import equity_risk_gauge, fetch_macro_markets
 from quant.flow import gex_profile, gex_summary, unusual_flow
+from quant.scanner import RISK_PROFILES, scan_setups
 from quant.seasonality import fundamental_snapshot, monthly_seasonality
 from quant.levels import fib_levels, hurst
 from quant.live import live_quote, market_status, patch_live_bar
@@ -267,6 +268,51 @@ def _memory_chips():
 
 
 _memory_chips()
+
+# ---------------------------------------------------------------------------
+# ⌨️ Terminal command line — type like a Bloomberg jockey
+# ---------------------------------------------------------------------------
+cmd = st.text_input("⌨️", placeholder="Command line — try: NVDA GO · AAPL PB · "
+                    "TSLA VOL · SCAN", key="cmdline",
+                    label_visibility="collapsed")
+if cmd:
+    parts = cmd.strip().upper().split()
+    try:
+        if parts[-1] == "GO" and len(parts) == 2:
+            _t = parts[0]
+            _q = live_quote(_t)
+            _d = fetch_history(_t, period="1y")
+            if _q and len(_d) > 220:
+                _v = analyze(_d)
+                cg = st.columns(5)
+                cg[0].metric(_t, f"${_q['price']:,.2f}",
+                             f"{_q['chg_pct']:+.2f}%")
+                cg[1].metric("Verdict", _v["verdict"])
+                cg[2].metric("Conviction", _v["conviction"])
+                cg[3].metric("Score", f"{_v['score']:+.2f}")
+                cg[4].metric("Signal Sharpe", _v["sharpe"])
+            else:
+                st.warning(f"{_t}: no data (throttled or bad ticker)")
+        elif parts[-1] == "PB" and len(parts) == 2:
+            _d = fetch_history(parts[0], period="1y")
+            if len(_d) > 220:
+                _pb = build_playbook(_d)
+                st.info(f"**{parts[0]} · {_pb['urgency']}** — "
+                        f"{_pb['instruction']}")
+        elif parts[-1] == "VOL" and len(parts) == 2:
+            _d = fetch_history(parts[0], period="2y")
+            _e = ewma_vol(_d); _g = garch_forecast(_d)
+            st.info(f"**{parts[0]} vol** — EWMA {_e['sigma_annual_pct']}% ann "
+                    f"(±${_e['expected_move_1d']}/day)"
+                    + (f" · GARCH {_g['sigma_annual_pct']}%" if _g else ""))
+        elif parts[0] == "SCAN":
+            st.info("→ open **🧬 Alpha engine** and hit **☀️ Scan today's "
+                    "setups** — the full ranked list lives there.")
+        else:
+            st.caption("Commands: `TICKER GO` quote+verdict · `TICKER PB` "
+                       "playbook · `TICKER VOL` volatility · `SCAN`")
+    except Exception:
+        st.warning("Command failed (data throttled?) — try again.")
 st.write("")
 
 PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
@@ -293,17 +339,73 @@ FIB_COLORS = {"0": "#6ee7b7", "0.236": "#34d399", "0.382": "#fbbf24",
 # ===========================================================================
 with tab_master:
     st.subheader("🧬 The master algorithm — one answer: what to do now")
-    st.caption("Research-backed cross-sectional anomalies × the 7-model verdict "
-               "engine × market regime gate × portfolio risk caps. "
-               "Built on published, replicated papers (citations below).")
-    c1, c2, c3, c4 = st.columns(4)
+    with st.expander("❓ How this machine works (read once — 60 seconds)"):
+        st.markdown("""
+Four filters in a row; a stock must survive ALL of them to reach your plan:
+
+**1️⃣ MARKET GATE** — is the overall market (SPY) healthy? Decides how much of your account may deploy at all (Bull·Calm = 100% → Bear·Storm = 15%). *Don't fight the tape.*
+
+**2️⃣ CROSS-SECTIONAL RANK** — all 50 stocks scored on 6 published anomalies (momentum, 52-week high, anti-lottery, low-vol, low-beta, reversal) and ranked against each other. Top decile advances; bottom 5 become the avoid list.
+
+**3️⃣ TIME-SERIES VERDICT** — survivors face the full 7-model engine (trend, B-X, MACD…) + a quick backtest of the signal on that exact ticker. Only LONG with real conviction passes. **This is the strictest gate — most days most names fail here. An empty plan means the machine is protecting you, not malfunctioning.**
+
+**4️⃣ RISK SIZING** — equal risk per position, total portfolio heat capped. Then the plan prints: ticker, shares, entry, stop, target.
+
+**☀️ Today's setups** below is the FAST lane: the same entry gates, no backtests — what's tradeable *right now*, in ~10 seconds.
+""")
+
+    prof_c1, prof_c2 = st.columns([1.2, 3])
+    ma_profile = prof_c1.selectbox("Risk profile", list(RISK_PROFILES.keys()),
+                                   index=1, key="ma_prof")
+    _pp = RISK_PROFILES[ma_profile]
+    prof_c2.caption(f"**{ma_profile}**: {_pp['risk_pct']}% risk/position · "
+                    f"up to {_pp['max_pos']} positions · "
+                    f"{_pp['heat_cap']}% total heat · conviction ≥ "
+                    f"{_pp['conviction_min']}. Aggressive ≈ 2-3× the P&L "
+                    f"swing of Conservative — in BOTH directions. The 🛡️ "
+                    f"risk-of-ruin stats in Backtest show what your profile "
+                    f"survives.")
+
+    c1, c2, c3 = st.columns(3)
     ma_acct = c1.number_input("Account $", 500, 1_000_000, 5000, step=500,
                               key="ma_acct")
-    ma_risk = c2.slider("Risk per position %", 0.5, 2.0, 1.0, 0.25,
-                        key="ma_risk")
-    ma_maxpos = c3.slider("Max positions", 2, 6, 4, key="ma_pos")
-    ma_custom = c4.text_input("Universe (empty = default 50)",
+    ma_custom = c2.text_input("Universe (empty = default 50)",
                               placeholder="AAPL, NVDA ...", key="ma_uni")
+    ma_aggfill = c3.toggle("Aggressive fill (never return empty)",
+                           value=("Aggressive" in ma_profile),
+                           help="If the strict gates pass <2 names, take the "
+                                "top alpha names at HALF size, tagged as "
+                                "lower-confidence.")
+    ma_risk = _pp["risk_pct"]
+    ma_maxpos = _pp["max_pos"]
+
+    # ---- ☀️ TODAY'S SETUPS — the daily trades scanner --------------------
+    if st.button("☀️ Scan today's setups (fast — all data, right now)",
+                 key="scan_today"):
+        uni_s = tuple(t.strip().upper() for t in ma_custom.split(",")
+                      if t.strip()) or tuple(DEFAULT_UNIVERSE)
+        with st.spinner(f"Playbook gates on {len(uni_s)} tickers…"):
+            data_s = fetch_many(uni_s, period="2y")
+            setups = scan_setups(data_s, account=float(ma_acct),
+                                 risk_pct=ma_risk)
+        if len(setups):
+            n_enter = int((setups["urgency"] == "🟢 ENTER").sum())
+            n_fast = int((setups["urgency"] == "🟡 FAST").sum())
+            st.success(f"**Today: {n_enter} full entries · {n_fast} dip "
+                       f"scalps · {len(setups)-n_enter-n_fast} stalking.** "
+                       f"Sized at {ma_profile} ({ma_risk}%/trade).")
+            st.dataframe(setups, use_container_width=True, hide_index=True)
+            st.caption("🟢 ENTER = all 5 gates green, full playbook trade. "
+                       "🟡 FAST = RSI2 panic in an uptrend — quick scalp, "
+                       "exit on the snap-back. 👀 STALK = one gate away; "
+                       "set an alert. Run any name through 🎯 Trade desk "
+                       "for the full workup before pulling the trigger.")
+        else:
+            st.info("**Zero setups today.** The market isn't offering — "
+                    "chasing anyway is how edges become donations. "
+                    "Tomorrow is another scan.")
+
+    st.markdown("---")
 
     if st.button("🚀 Run the machine", type="primary", key="ma_run"):
         uni = tuple(t.strip().upper() for t in ma_custom.split(",")
@@ -314,7 +416,10 @@ with tab_master:
         spy = fetch_history("SPY", period="2y")
         prog.progress(45, text="Ranking cross-sectional anomalies…")
         res = run_master(data, spy, account=float(ma_acct),
-                         risk_pct=ma_risk, max_positions=ma_maxpos)
+                         risk_pct=ma_risk, max_positions=ma_maxpos,
+                         heat_cap_pct=_pp["heat_cap"],
+                         conviction_min=_pp["conviction_min"],
+                         aggressive_fill=ma_aggfill)
         prog.progress(100, text="Done")
         prog.empty()
         st.session_state["master_res"] = res
@@ -342,6 +447,11 @@ with tab_master:
         if len(res["plan"]):
             st.dataframe(res["plan"], use_container_width=True,
                          hide_index=True)
+            if res["plan"]["action"].str.contains("½").any():
+                st.caption("*½size = aggressive fill: strong alpha rank but "
+                           "the verdict engine wasn't fully convinced — "
+                           "taken at HALF risk so a good rank can't hurt "
+                           "you at full weight.")
             st.success(f"**Do this:** open the {len(res['plan'])} position(s) "
                        f"above with the exact share counts, place the stops "
                        f"immediately, keep ${res['cash']:,.0f} in cash. "
