@@ -11,6 +11,7 @@ from quant.advanced import ewma_vol, kelly, regime_quadrant, support_resistance
 from quant.anomalies import ANOMALY_INFO
 from quant.master import run_master
 from quant.backtest import BTConfig, run_backtest, walk_forward
+from quant.bxlab import parameter_sweep, state_probabilities
 from quant.bxtrender import (bxtrender, detect_divergence, event_study,
                              weekly_alignment)
 from quant.data import DEFAULT_UNIVERSE, fetch_history, fetch_many
@@ -23,6 +24,7 @@ from quant.journal import (journal_from_csv, journal_to_csv, load_journal,
                            mark_to_market, record_plan, save_journal)
 from quant.garch_pairs import garch_forecast, pairs_analysis
 from quant.montecarlo import cone, simulate, trade_odds
+from quant.playbook import build_playbook
 from quant.portfolio import build_prices, optimize
 from quant.runner import run_machine
 from quant.risk import (correlation_heat, kelly_ladder, portfolio_var,
@@ -143,6 +145,20 @@ div[data-testid="stExpander"] {
   background: rgba(19,26,34,.9); border: 1px solid #2a3644;
 }
 hr { border-color: #1f2a36; }
+
+/* ---- terminal touches ---- */
+.tape {
+  overflow: hidden; white-space: nowrap; border-top: 1px solid #1f2a36;
+  border-bottom: 1px solid #1f2a36; background: #0a0e13;
+  font-family: 'JetBrains Mono', monospace; font-size: .85rem;
+  padding: 6px 0; margin: 4px 0 10px 0;
+}
+.tape-inner { display: inline-block; animation: scroll 40s linear infinite; }
+@keyframes scroll { 0% {transform: translateX(0)} 100% {transform: translateX(-50%)} }
+.tape .up { color: #10b981; } .tape .dn { color: #ef4444; }
+.tape .amber { color: #ffb000; font-weight: 700; }
+div[data-testid="stDataFrame"] { font-family: 'JetBrains Mono', monospace; }
+[data-testid="stMetricDelta"] { font-family: 'JetBrains Mono', monospace; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: #1f2a36; border-radius: 8px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(16,185,129,.5); }
@@ -201,6 +217,22 @@ def _watchlist_strip():
             col.metric(s.replace("^", ""), "—")
     cols[-1].caption(f"{'🔴 LIVE' if LIVE_EVERY else '⏸ static'} · "
                      f"updated {_dt.now().strftime('%H:%M:%S')}")
+    tape_syms = ["SPY", "QQQ", "^VIX", "AAPL", "NVDA", "MSFT", "TSLA",
+                 "AMZN", "GLD", "TLT"]
+    parts = []
+    for ts_ in tape_syms:
+        tq = live_quote(ts_)
+        if tq:
+            cls = "up" if tq["chg_pct"] >= 0 else "dn"
+            arrow = "▲" if tq["chg_pct"] >= 0 else "▼"
+            parts.append(f"<span class='amber'>{ts_.replace('^','')}</span> "
+                         f"<span class='{cls}'>{tq['price']:,.2f} {arrow}"
+                         f"{abs(tq['chg_pct']):.2f}%</span>")
+    if parts:
+        line = " &nbsp;·&nbsp; ".join(parts)
+        st.markdown(f"<div class='tape'><div class='tape-inner'>{line}"
+                    f" &nbsp;·&nbsp; {line}</div></div>",
+                    unsafe_allow_html=True)
 
 
 _watchlist_strip()
@@ -706,6 +738,37 @@ with tab_desk:
                      max(odds["p_target_first"] + odds["p_stop_first"], 1e-9))
             kel = kelly(p_win, v["rr"])
 
+        # ---- 📖 PLAYBOOK — the WHEN engine -----------------------------------
+        pb = build_playbook(df, account=account, risk_pct=risk_pct)
+        urg_color = {"🟢 ACTIONABLE": "#10b981", "🟡 FAST SETUP": "#f59e0b",
+                     "🟡 WATCH": "#f59e0b", "⚪ NO TRADE": "#6b7280",
+                     "🟢 CALM": "#10b981", "🟡 SOON": "#f59e0b",
+                     "🟠 TODAY": "#f97316", "🔴 IMMEDIATE": "#ef4444"}.get(
+            pb["urgency"], "#8b98a5")
+        st.markdown(f"""
+        <div style="border:1px solid {urg_color};border-radius:16px;
+                    padding:18px 22px;margin-bottom:14px;
+                    background:linear-gradient(135deg,rgba(19,26,34,.95),
+                    rgba(11,15,20,.95));box-shadow:0 0 24px {urg_color}22">
+          <div style="font-size:.8rem;color:{urg_color};font-weight:800;
+                      letter-spacing:1px">📖 PLAYBOOK · {pb['urgency']} ·
+                      {pb['greens']}/5 gates green</div>
+          <div style="font-size:1.15rem;font-weight:700;margin-top:6px;
+                      font-family:'JetBrains Mono',monospace">
+                      {pb['instruction']}</div>
+        </div>""", unsafe_allow_html=True)
+        gc = st.columns(5)
+        for col, (name, ok, detail) in zip(gc, pb["gates"]):
+            col.markdown(f"{'✅' if ok else '⛔'} **{name.split('(')[0]}**")
+            col.caption(detail)
+        with st.expander("❓ The playbook — when to enter, manage, exit"):
+            st.markdown("""
+The playbook runs the exact five gates the backtest engine trades, live:
+**ENTER** when all 5 are green (with shares/stop/scale levels printed). **DIP SETUP** when RSI(2) panics inside an intact uptrend — the fast scalp lane. **STALK** at 3–4 greens: it names what's blocking, you set an alert. **STAND DOWN** below that — no setup exists, and forcing one is how accounts bleed.
+
+Once you're in a trade, re-run with your entry/stop (Runner tracks this automatically) and the playbook switches to management: **PROTECT** at +1R (stop → breakeven), **SCALE** at +2R (bank a third), **TIGHTEN** when B-X rolls over, **EXIT** on a composite flip or stop violation — each with an urgency color. It's the same lifecycle the ⚙️ Runner trades historically, pointed at *right now*.
+""")
+
         # ---- Regime + vol forecast row --------------------------------------
         garch = garch_forecast(df) if tf == "Daily" else {}
         rg1, rg2, rg3, rg4, rg5 = st.columns([1.6, 1, 1, 1, 1])
@@ -939,6 +1002,24 @@ The verdict fuses seven models (trend, momentum, B-Xtrender, MACD, RSI, mean-rev
                     f"signal on {tkr}:**")
         st.dataframe(event_study(df), use_container_width=True, hide_index=True)
 
+        st.markdown("**🔬 BX Lab — probability-calibrated states "
+                    f"({tkr}, 5-bar horizon):**")
+        sp_tab = state_probabilities(df)
+        st.dataframe(sp_tab, use_container_width=True, hide_index=True)
+        st.caption(f"Current state: **{sp_tab.attrs.get('current_state','—')}**"
+                   " — find it in the table for its historical odds.")
+        if st.button("🧪 Run BX parameter sweep (8 presets, OOS-validated)",
+                     key="bx_sweep"):
+            with st.spinner("Testing 8 parameter sets, out-of-sample…"):
+                sw = parameter_sweep(df)
+            st.dataframe(sw, use_container_width=True, hide_index=True)
+            best = sw.iloc[0]
+            st.caption(f"Best OOS: **{best['preset']}** (Sharpe "
+                       f"{best['OOS Sharpe']}). Watch the **overfit gap** "
+                       f"column — a preset that shines in-sample and dies "
+                       f"OOS is curve-fitting, and this table catches it "
+                       f"in the act.")
+
         with st.expander("❓ What is B-Xtrender & the upgrades here?"):
             st.markdown("""
 **B-Xtrender** (Bharat Jhunjhunwala, IFTA Journal) — an RSI applied to the *spread between two EMAs*, filtered by a Tillson T3 line. Faster than MACD, cleaner than raw RSI.
@@ -1167,7 +1248,8 @@ with tab_backtest:
     bt_cash = c3.number_input("Starting cash $", 500, 1_000_000, 5000,
                               step=500)
     bt_risk = c4.slider("Risk per trade %", 0.5, 5.0, 1.0, 0.5)
-    bt_mode = c5.selectbox("Engine", ["auto", "core", "trend", "dip"], index=0,
+    bt_mode = c5.selectbox("Engine", ["auto", "core", "trend", "dip",
+                                      "blend"], index=0,
                            help="auto picks per ticker by Hurst exponent")
     bt_short = st.checkbox("Allow shorts (trend mode, below 200-SMA only)",
                            value=False, key="bt_short")
@@ -1400,6 +1482,45 @@ The same rules re-run on 4 separate sequential periods. A real edge shows in mos
                            "⚪ time) · connecting line green = winner, "
                            "red = loser. Hover any marker for exact price, "
                            "date, reason and P&L.")
+
+                colR, colM = st.columns(2)
+                with colR:
+                    if "R" in res.trades:
+                        figR = go.Figure(go.Histogram(
+                            x=res.trades["R"], nbinsx=24,
+                            marker_color=np.where(
+                                np.histogram(res.trades["R"], bins=24)[1][:-1]
+                                >= 0, "#10b981", "#ef4444")))
+                        figR.add_vline(x=0, line_color="#8b98a5")
+                        figR.update_layout(height=300,
+                                           title="R-multiple distribution",
+                                           xaxis_title="R", yaxis_title="trades",
+                                           margin=dict(l=10, r=10, t=40, b=10),
+                                           **PLOTLY_LAYOUT)
+                        st.plotly_chart(figR, use_container_width=True)
+                with colM:
+                    if "MAE_R" in res.trades:
+                        figM = go.Figure(go.Scatter(
+                            x=res.trades["MAE_R"], y=res.trades["MFE_R"],
+                            mode="markers",
+                            marker=dict(size=9,
+                                        color=np.where(res.trades["pnl"] > 0,
+                                                       "#10b981", "#ef4444"))))
+                        figM.add_shape(type="line", x0=0, y0=0, x1=1, y1=1,
+                                       line=dict(color="#8b98a5", dash="dot"))
+                        figM.update_layout(height=300,
+                                           title="MAE vs MFE (per trade, in R)",
+                                           xaxis_title="Max pain (MAE, R)",
+                                           yaxis_title="Max gain (MFE, R)",
+                                           margin=dict(l=10, r=10, t=40, b=10),
+                                           **PLOTLY_LAYOUT)
+                        st.plotly_chart(figM, use_container_width=True)
+                with st.expander("❓ R-distribution & MAE/MFE — pro trade forensics"):
+                    st.markdown("""
+- **R-multiple distribution** — every trade's P&L in risk units. A healthy system: losses clustered at −1R (stops doing their job), a right tail of +2R/+3R winners. Losses beyond −1R = slippage/gap problem; no right tail = you're cutting winners.
+- **MAE vs MFE** — each dot is one trade: how far it went AGAINST you (x) vs FOR you (y). Green dots high-left = ideal (little pain, much gain). Red dots that reached high MFE = winners you gave back → tighten trailing. Many reds with tiny MAE = stops too tight; they died without ever being wrong.
+This is the same trade-forensics workflow a Bloomberg BTST user runs.
+""")
 
                 st.markdown("#### Trade log")
                 st.dataframe(res.trades, use_container_width=True, height=300)
