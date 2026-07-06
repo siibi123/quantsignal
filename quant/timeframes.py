@@ -24,8 +24,11 @@ TF_LABELS = list(TIMEFRAMES.keys())
 def fetch_tf(ticker: str, tf_label: str, period: str | None = None) -> pd.DataFrame:
     """Fetch OHLCV at the chosen timeframe. Real (unadjusted) prices."""
     interval, default_period, _, _ = TIMEFRAMES[tf_label]
-    df = yf.Ticker(ticker).history(period=period or default_period,
-                                   interval=interval, auto_adjust=False)
+    try:
+        df = yf.Ticker(ticker).history(period=period or default_period,
+                                       interval=interval, auto_adjust=False)
+    except Exception:
+        return pd.DataFrame()
     if df.empty:
         return df
     df = df.rename(columns=str.title)

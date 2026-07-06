@@ -39,7 +39,7 @@ def market_status() -> dict:
             "et_time": now.strftime("%H:%M:%S ET")}
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=45, show_spinner=False)
 def live_quote(ticker: str) -> dict:
     """Latest price + day change. Cached 20s so refresh loops stay polite."""
     try:

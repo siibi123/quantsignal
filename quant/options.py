@@ -68,13 +68,15 @@ def fetch_chains(ticker: str, max_expiries: int = 8) -> tuple[float, pd.DataFram
     Columns: expiry (str), dte (int), strike, iv (%), type (C/P),
              volume, oi, bid, ask, last, moneyness.
     """
-    t = yf.Ticker(ticker)
-    hist = t.history(period="5d")
-    if hist.empty:
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="5d")
+        if hist.empty:
+            return 0.0, pd.DataFrame()
+        spot = float(hist["Close"].iloc[-1])
+        expiries = list(t.options)[:max_expiries]
+    except Exception:
         return 0.0, pd.DataFrame()
-    spot = float(hist["Close"].iloc[-1])
-
-    expiries = list(t.options)[:max_expiries]
     today = dt.date.today()
     rows = []
     for exp in expiries:
