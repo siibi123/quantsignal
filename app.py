@@ -170,13 +170,18 @@ lc1, lc2, lc3 = st.columns([1.1, 1, 3])
 live_on = lc1.toggle("🔴 LIVE mode", value=False, key="live_on",
                      help="Armed panels (watchlist, Trade desk, Runner, "
                           "Track record) auto-refresh with live prices.")
-live_every = lc2.selectbox("Pulse", [15, 30, 60, 120], index=1,
+live_every = lc2.selectbox("Pulse", [30, 60, 120], index=1,
                            key="live_every",
                            format_func=lambda s: f"every {s}s")
 LIVE_EVERY = live_every if live_on else None
 lc3.markdown(f"<div class='regime-badge'>{ms['emoji']} {ms['label']} · "
              f"{ms['detail']} · {ms['et_time']}</div>",
              unsafe_allow_html=True)
+if live_on:
+    st.caption("🔴 Live uses the free Yahoo feed on a shared IP — if data "
+               "briefly shows '—' or a rate-limit note, that's throttling, "
+               "not a crash. It recovers on the next pulse; a slower pulse "
+               "helps.")
 
 
 @st.fragment(run_every=LIVE_EVERY)
