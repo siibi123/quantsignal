@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from quant.advanced import ewma_vol, kelly, regime_quadrant, support_resistance
+from quant.analyst import morning_briefing, ticker_news
 from quant.anomalies import ANOMALY_INFO
 from quant.master import run_master
 from quant.backtest import BTConfig, run_backtest, walk_forward
@@ -319,11 +320,12 @@ PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
                      plot_bgcolor="rgba(0,0,0,0)",
                      font=dict(family="Inter", color="#e6edf3"))
 
-(tab_master, tab_journal, tab_runner, tab_desk, tab_screener, tab_backtest,
- tab_options, tab_pp, tab_events, tab_rl, tab_sizing) = st.tabs(
-    ["🧬 Alpha engine", "📒 Track record", "⚙️ Runner", "🎯 Trade desk",
-     "🔍 Screener", "🧪 Backtest", "🌋 Options / IV surface",
-     "⚖️ Portfolio & Pairs", "🌐 Event radar", "🤖 RL lab", "💰 Position size"]
+(tab_analyst, tab_master, tab_journal, tab_runner, tab_desk, tab_screener,
+ tab_backtest, tab_options, tab_pp, tab_events, tab_rl, tab_sizing) = st.tabs(
+    ["🤵 Analyst", "🧬 Alpha engine", "📒 Track record", "⚙️ Runner",
+     "🎯 Trade desk", "🔍 Screener", "🧪 Backtest",
+     "🌋 Options / IV surface", "⚖️ Portfolio & Pairs", "🌐 Event radar",
+     "🤖 RL lab", "💰 Position size"]
 )
 
 SIGNAL_COLORS = {"BUY": "#10b981", "SELL": "#ef4444", "HOLD": "#8a8a8a"}
@@ -333,6 +335,106 @@ FIB_COLORS = {"0": "#6ee7b7", "0.236": "#34d399", "0.382": "#fbbf24",
               "0.5": "#f59e0b", "0.618": "#f97316", "0.786": "#ef4444",
               "1": "#dc2626"}
 
+
+
+# ===========================================================================
+# -1. THE ANALYST — runs the whole desk, writes you the note
+# ===========================================================================
+with tab_analyst:
+    st.subheader("🤵 The Analyst — your desk, run for you")
+    st.caption("One button executes the entire operation: market regime, "
+               "macro odds, all 50 tickers through the setup gates, every "
+               "open position through the playbook, book-level risk, the "
+               "news touching your names, and a statistical self-audit of "
+               "the live track record. Every sentence is computed, never "
+               "imagined.")
+    a1, a2, a3 = st.columns(3)
+    an_acct = a1.number_input("Account $", 500, 1_000_000, 5000, step=500,
+                              key="an_acct")
+    an_prof = a2.selectbox("Risk profile", list(RISK_PROFILES.keys()),
+                           index=1, key="an_prof")
+    an_news = a3.toggle("Include news", value=True, key="an_news")
+
+    if st.button("☕ Run my morning", type="primary", key="an_run"):
+        _ap = RISK_PROFILES[an_prof]
+        prog = st.progress(0, text="Market regime…")
+        spy = fetch_history("SPY", period="2y")
+        prog.progress(15, text="Macro event odds…")
+        gauge = None
+        try:
+            ev = fetch_macro_markets()
+            gauge = equity_risk_gauge(ev) if len(ev) else None
+        except Exception:
+            pass
+        prog.progress(30, text="Scanning the universe…")
+        data = fetch_many(tuple(DEFAULT_UNIVERSE), period="2y")
+        prog.progress(60, text="Marking your book…")
+        jj = load_journal()
+        blotter = None
+        if jj["positions"]:
+            mtm = mark_to_market(
+                jj, lambda t: patch_live_bar(fetch_history(t, period="1y"), t))
+            save_journal(jj)
+            blotter = mtm.get("blotter")
+        prog.progress(80, text="Writing the note…")
+        brief = morning_briefing(spy, data, blotter, float(an_acct),
+                                 _ap["risk_pct"], gauge)
+        prog.progress(100); prog.empty()
+        st.session_state["briefing"] = brief
+
+    if "briefing" in st.session_state:
+        brief = st.session_state["briefing"]
+        st.markdown(f"""<div style="border:1px solid #ffb000;border-radius:14px;
+            padding:14px 20px;background:rgba(255,176,0,.05);
+            font-family:'JetBrains Mono',monospace">
+            <span style="color:#ffb000;font-weight:800">MORNING NOTE</span>
+            · {brief['stamp']} · profile: {st.session_state.get('an_prof','')}
+            </div>""", unsafe_allow_html=True)
+        st.write("")
+
+        sec_defs = [("🌍 Market", "market"), ("💼 Your book", "book"),
+                    ("☀️ Today's trades", "setups"),
+                    ("👀 Watch list", "watch"),
+                    ("🔬 System self-audit", "audit")]
+        for title, key in sec_defs:
+            lines = brief.get(key) or []
+            if not lines:
+                continue
+            st.markdown(f"#### {title}")
+            for ln in lines:
+                cls = "reason-con" if ("⚠️" in ln or "🔴" in ln) else "reason-pro"
+                st.markdown(f"<div class='{cls}'>{ln}</div>",
+                            unsafe_allow_html=True)
+            st.write("")
+
+        if len(brief["setups_table"]):
+            with st.expander("📋 Full setups table (sized to your profile)"):
+                st.dataframe(brief["setups_table"],
+                             use_container_width=True, hide_index=True)
+
+        if st.session_state.get("an_news") and brief["news_tickers"]:
+            st.markdown("#### 📰 News on your names")
+            nws = ticker_news(tuple(brief["news_tickers"]))
+            if len(nws):
+                for _, r in nws.iterrows():
+                    st.markdown(f"<div class='reason-pro'>"
+                                f"<b style='color:#ffb000'>{r['ticker']}</b> — "
+                                f"<a href='{r['url']}' target='_blank' "
+                                f"style='color:#e6edf3'>{r['headline']}</a> "
+                                f"<span style='color:#8b98a5;font-size:.8rem'>"
+                                f"({r['source']})</span></div>",
+                                unsafe_allow_html=True)
+            else:
+                st.caption("News feed empty or throttled right now.")
+
+        with st.expander("❓ What the Analyst is (and deliberately isn't)"):
+            st.markdown("""
+The Analyst is an **orchestrator**: it runs every engine on the site in sequence and converts the numbers into sentences by fixed rules. If it says your position is +1.4R and the stop should move — that came from the playbook math, checkable in the 🎯 desk. If it says the live edge isn't statistically proven yet — that's the bootstrap CI on your actual recorded trades.
+
+What it deliberately **isn't**: a language model improvising opinions. In trading, confident-sounding text without verified computation behind it is how accounts die. Everything here is auditable — click into any tab and find the number behind the sentence. If we ever add a conversational layer, it will only be allowed to narrate what these engines computed.
+
+**The routine**: ☕ every morning before the open (16:30 your time). Read the note top to bottom — market, your book's instructions, today's trades, the watch list. Execute through the Trade desk, record to the Track record. The self-audit keeps score of whether the whole thing is actually working — and it will tell you honestly if it isn't.
+""")
 
 # ===========================================================================
 # 0. ALPHA ENGINE — the master algorithm
