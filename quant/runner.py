@@ -68,6 +68,9 @@ def run_machine(df: pd.DataFrame, account: float = 5000.0,
     events: list[dict] = []
     equity = []
 
+    closures: list[dict] = []
+    entry_ctx: dict = {}
+
     def log(i, ev, px, qty, note):
         events.append({
             "date": idx[i].date(), "event": ev, "price": round(float(px), 2),
@@ -75,6 +78,7 @@ def run_machine(df: pd.DataFrame, account: float = 5000.0,
             "equity": round(cash + sh * c_[i], 0),
             "score": round(float(score[i - 1]), 2),
             "bx": f"{bxl[i-1]:+.0f}{'↑' if bxr[i-1] else '↓'}",
+            "rsi2": round(float(r2.values[i - 1])),
             "note": note,
         })
 
@@ -85,7 +89,28 @@ def run_machine(df: pd.DataFrame, account: float = 5000.0,
             return
         cash += qty * px * (1 - commission)
         sh -= qty
+        if entry_ctx:
+            entry_ctx["realized"] += qty * (px - entry_px)
         log(i, ev, px, qty, note)
+        if sh == 0 and entry_ctx:
+            invested = entry_ctx["invested"]
+            pnl = entry_ctx["realized"]
+            closures.append({
+                "opened": idx[entry_i].date(), "closed": idx[i].date(),
+                "bars": int(i - entry_i),
+                "entry $": round(entry_px, 2),
+                "final exit $": round(px, 2),
+                "price chg %": round((px / entry_px - 1) * 100, 2),
+                "capital in $": round(invested, 0),
+                "P&L $": round(pnl, 0),
+                "return on capital %": round(pnl / invested * 100, 2)
+                if invested else 0,
+                "R": round(pnl / (sh0 * r_unit), 2) if r_unit > 0 else 0,
+                "exit reason": ev,
+                "entry score": round(entry_ctx["score"], 2),
+                "entry BX": round(entry_ctx["bx_long"], 0),
+                "entry RSI2": round(entry_ctx["rsi2"], 0),
+            })
 
     for i in range(1, len(df)):
         o, hi, lo = o_[i], h_[i], l_[i]
@@ -162,8 +187,15 @@ def run_machine(df: pd.DataFrame, account: float = 5000.0,
                     r_unit = stop_d
                     stop = o - stop_d
                     scaled1 = scaled2 = False
+                    entry_ctx = {"score": float(score[i - 1]),
+                                 "bx_long": float(bxl[i - 1]),
+                                 "rsi2": float(r2.values[i - 1]),
+                                 "invested": qty * o,
+                                 "realized": 0.0}
                     log(i, f"ENTRY ({mode.upper()})", o, qty,
-                        why + f" · stop ${stop:,.2f}")
+                        why + f" · stop ${stop:,.2f} · invested "
+                        f"${qty * o:,.0f} ({qty * o / account * 100:.0f}% "
+                        f"of account)")
 
         equity.append(cash + sh * c_[i])
 
@@ -207,5 +239,44 @@ def run_machine(df: pd.DataFrame, account: float = 5000.0,
         "Max DD %": round(float((eq / eq.cummax() - 1).min()) * 100, 1),
         "Events logged": int(len(ev_df)),
     }
+    closed_df = pd.DataFrame(closures)
+
+    # ---- 🎓 self-learning: what did the machine learn on THIS ticker? -----
+    lessons: list[str] = []
+    if len(closed_df) >= 5:
+        by_reason = closed_df.groupby("exit reason")["P&L $"].agg(
+            ["count", "sum", "mean"]).sort_values("sum", ascending=False)
+        best_r, worst_r = by_reason.index[0], by_reason.index[-1]
+        lessons.append(f"Exit analysis: '{best_r}' exits made the most "
+                       f"(${by_reason.loc[best_r,'sum']:,.0f} over "
+                       f"{int(by_reason.loc[best_r,'count'])} trades); "
+                       f"'{worst_r}' cost the most "
+                       f"(${by_reason.loc[worst_r,'sum']:,.0f}).")
+        hiBX = closed_df[closed_df["entry BX"] >= 25]
+        loBX = closed_df[closed_df["entry BX"] < 25]
+        if len(hiBX) >= 3 and len(loBX) >= 3:
+            lessons.append(f"Entry-quality: trades opened with strong B-X "
+                           f"(≥+25) won {float((hiBX['P&L $']>0).mean())*100:.0f}%"
+                           f" vs {float((loBX['P&L $']>0).mean())*100:.0f}% "
+                           f"with weak B-X → on {'this ticker' } demand the "
+                           f"stronger confirmation.")
+        wr = float((closed_df["P&L $"] > 0).mean() * 100)
+        avg_roc = float(closed_df["return on capital %"].mean())
+        lessons.append(f"Overall on this ticker: {len(closed_df)} closed "
+                       f"round-trips · {wr:.0f}% won · avg "
+                       f"{avg_roc:+.2f}% return on deployed capital per trade.")
+        held_w = closed_df[closed_df["P&L $"] > 0]["bars"].mean()
+        held_l = closed_df[closed_df["P&L $"] <= 0]["bars"].mean()
+        if held_w and held_l:
+            lessons.append(f"Time asymmetry: winners held "
+                           f"{held_w:.0f} bars vs losers {held_l:.0f} — "
+                           + ("healthy (cutting losers fast)."
+                              if held_w > held_l else
+                              "⚠️ losers held LONGER than winners — the "
+                              "classic account-killer; trust the time stop."))
+    elif len(closed_df):
+        lessons.append(f"Only {len(closed_df)} closed trades — the machine "
+                       f"needs ~5+ round-trips before its lessons mean much.")
+
     return {"events": ev_df, "equity": eq, "state": state, "stats": stats,
-            "mode": mode}
+            "mode": mode, "closures": closed_df, "lessons": lessons}

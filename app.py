@@ -9,6 +9,8 @@ import streamlit as st
 
 from quant.advanced import ewma_vol, kelly, regime_quadrant, support_resistance
 from quant.analyst import morning_briefing, ticker_news
+from quant.autotrader import (bot_equity, bot_tick, default_state, load_bot,
+                              save_bot)
 from quant.anomalies import ANOMALY_INFO
 from quant.master import run_master
 from quant.backtest import BTConfig, run_backtest, walk_forward
@@ -191,6 +193,11 @@ live_on = lc1.toggle("🔴 LIVE mode", value=False, key="live_on",
 live_every = lc2.selectbox("Pulse", [30, 60, 120], index=1,
                            key="live_every",
                            format_func=lambda s: f"every {s}s")
+wl_input = lc2.text_input("Watchlist", value="SPY, QQQ, ^VIX",
+                          key="wl_input", label_visibility="collapsed",
+                          placeholder="Watchlist: SPY, QQQ, ^VIX ...")
+st.session_state["watchlist"] = [t.strip().upper() for t in
+                                 wl_input.split(",") if t.strip()][:6]
 LIVE_EVERY = live_every if live_on else None
 lc3.markdown(f"<div class='regime-badge'>{ms['emoji']} {ms['label']} · "
              f"{ms['detail']} · {ms['et_time']}</div>",
@@ -205,7 +212,7 @@ if live_on:
 @st.fragment(run_every=LIVE_EVERY)
 def _watchlist_strip():
     from datetime import datetime as _dt
-    syms = ["SPY", "QQQ", "^VIX"]
+    syms = st.session_state.get("watchlist", ["SPY", "QQQ", "^VIX"])[:6]
     armed = st.session_state.get("desk_params", {}).get("tkr")
     if armed and armed not in syms:
         syms.append(armed)
@@ -219,8 +226,9 @@ def _watchlist_strip():
             col.metric(s.replace("^", ""), "—")
     cols[-1].caption(f"{'🔴 LIVE' if LIVE_EVERY else '⏸ static'} · "
                      f"updated {_dt.now().strftime('%H:%M:%S')}")
-    tape_syms = ["SPY", "QQQ", "^VIX", "AAPL", "NVDA", "MSFT", "TSLA",
-                 "AMZN", "GLD", "TLT"]
+    tape_syms = list(dict.fromkeys(
+        st.session_state.get("watchlist", []) +
+        ["SPY", "QQQ", "^VIX", "AAPL", "NVDA", "MSFT", "TSLA", "GLD"]))[:10]
     parts = []
     for ts_ in tape_syms:
         tq = live_quote(ts_)
@@ -320,10 +328,11 @@ PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
                      plot_bgcolor="rgba(0,0,0,0)",
                      font=dict(family="Inter", color="#e6edf3"))
 
-(tab_analyst, tab_master, tab_journal, tab_runner, tab_desk, tab_screener,
- tab_backtest, tab_options, tab_pp, tab_events, tab_rl, tab_sizing) = st.tabs(
-    ["🤵 Analyst", "🧬 Alpha engine", "📒 Track record", "⚙️ Runner",
-     "🎯 Trade desk", "🔍 Screener", "🧪 Backtest",
+(tab_analyst, tab_bot, tab_master, tab_journal, tab_runner, tab_desk,
+ tab_screener, tab_backtest, tab_options, tab_pp, tab_events, tab_rl,
+ tab_sizing) = st.tabs(
+    ["🤵 Analyst", "🦾 AutoTrader", "🧬 Alpha engine", "📒 Track record",
+     "⚙️ Runner", "🎯 Trade desk", "🔍 Screener", "🧪 Backtest",
      "🌋 Options / IV surface", "⚖️ Portfolio & Pairs", "🌐 Event radar",
      "🤖 RL lab", "💰 Position size"]
 )
@@ -434,6 +443,121 @@ The Analyst is an **orchestrator**: it runs every engine on the site in sequence
 What it deliberately **isn't**: a language model improvising opinions. In trading, confident-sounding text without verified computation behind it is how accounts die. Everything here is auditable — click into any tab and find the number behind the sentence. If we ever add a conversational layer, it will only be allowed to narrate what these engines computed.
 
 **The routine**: ☕ every morning before the open (16:30 your time). Read the note top to bottom — market, your book's instructions, today's trades, the watch list. Execute through the Trade desk, record to the Track record. The self-audit keeps score of whether the whole thing is actually working — and it will tell you honestly if it isn't.
+""")
+
+
+# ===========================================================================
+# -0.5 AUTOTRADER — the bot that lives here
+# ===========================================================================
+with tab_bot:
+    st.subheader("🦾 AutoTrader — the in-website trading bot (paper)")
+    st.caption("Give it a mandate once, flip it ON. It scans, stages orders "
+               "for the open, fills them, banks profits at +1R/+2R, trails, "
+               "stops out — and narrates every decision. While the site is "
+               "closed it sleeps; on your next visit it CATCHES UP bar-by-"
+               "bar, executing exactly what the rules dictated. Real "
+               "prices, paper money — building the record that decides if "
+               "this logic ever touches a real broker.")
+
+    bot = load_bot()
+
+    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1.6])
+    with bc1:
+        enabled = st.toggle("🦾 BOT ACTIVE", value=bot["enabled"],
+                            key="bot_on")
+    bot_prof = bc2.selectbox("Risk profile", list(RISK_PROFILES.keys()),
+                             index=1, key="bot_prof")
+    bot_acct = bc3.number_input("Paper capital $", 1000, 1_000_000,
+                                int(bot.get("start_equity", 5000)),
+                                step=1000, key="bot_acct")
+    _bp = RISK_PROFILES[bot_prof]
+    bc4.caption(f"Mandate: {_bp['risk_pct']}%/trade · max "
+                f"{_bp['max_pos']} positions · default 50-name universe · "
+                f"entries only on 🟢 5/5-gate setups · scale ⅓ at +1R and "
+                f"+2R · 2.5×ATR trail.")
+
+    colA, colB = st.columns([1, 4])
+    if colA.button("🔄 Reset bot (wipe paper history)", key="bot_reset"):
+        bot = default_state(float(bot_acct))
+        save_bot(bot)
+        st.success("Bot reset — fresh paper account.")
+
+    if enabled != bot["enabled"]:
+        bot["enabled"] = enabled
+        if enabled and not bot["created"]:
+            bot = default_state(float(bot_acct))
+            bot["enabled"] = True
+            from datetime import datetime as _dtnow, timezone as _tz
+            bot["created"] = _dtnow.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+        bot["mandate"]["risk_pct"] = _bp["risk_pct"]
+        bot["mandate"]["max_positions"] = _bp["max_pos"]
+        save_bot(bot)
+
+    if bot["enabled"]:
+        @st.fragment(run_every=LIVE_EVERY)
+        def _bot_live():
+            b = load_bot()
+            with st.spinner("Bot tick — catching up & deciding…"):
+                data_b = fetch_many(tuple(DEFAULT_UNIVERSE), period="2y")
+                spy_b = fetch_history("SPY", period="2y")
+                if spy_b.empty or not data_b:
+                    st.warning("Data throttled — bot will retry next pulse.")
+                    return
+                b = bot_tick(b, data_b, spy_b)
+                save_bot(b)
+                eq = bot_equity(b, data_b)
+
+            m = st.columns(6)
+            m[0].metric("Paper equity", f"${eq['equity']:,.0f}",
+                        f"{eq['return_pct']:+.2f}%")
+            m[1].metric("Cash", f"${eq['cash']:,.0f}")
+            m[2].metric("Open positions", len(eq["open_table"]))
+            m[3].metric("Closed deals", len(eq["closed_table"]))
+            m[4].metric("Wins", eq["n_wins"])
+            m[5].metric("Realized P&L", f"${eq['realized']:+,.0f}")
+            st.caption(f"Bot since {b.get('created','—')} · last processed "
+                       f"session: {b.get('last_tick','—')} · "
+                       f"{'🔴 watching live' if LIVE_EVERY else '⏸ tick on load only (turn LIVE on to watch it work)'}")
+
+            if len(eq["open_table"]):
+                st.markdown("**📈 Bot holdings (live marks):**")
+                st.dataframe(eq["open_table"], use_container_width=True,
+                             hide_index=True)
+            if b["pending"]:
+                st.markdown("**📋 Orders staged for next open:**")
+                for od in b["pending"]:
+                    st.markdown(f"<div class='reason-pro'>📋 BUY "
+                                f"{od['shares']} {od['ticker']} at open — "
+                                f"{od['why']}</div>", unsafe_allow_html=True)
+
+            st.markdown("**🗣️ Bot decision feed (newest first):**")
+            for L in list(reversed(b["log"]))[:12]:
+                good = any(k in L["action"] for k in ("BUY", "SCALE", "ORDER"))
+                st.markdown(f"<div class='{'reason-pro' if good else 'reason-con'}'"
+                            f" style=\"font-family:'JetBrains Mono',monospace\">"
+                            f"{L['action']} <b>{L['ticker']}</b> · "
+                            f"{L['shares']} sh @ ${L['price']:,.2f} · "
+                            f"{L['date']}<br>→ {L['why']}</div>",
+                            unsafe_allow_html=True)
+
+            if len(eq["closed_table"]):
+                st.markdown("**🧾 Bot deal ledger:**")
+                st.dataframe(eq["closed_table"].iloc[::-1],
+                             use_container_width=True, hide_index=True,
+                             height=280)
+        _bot_live()
+    else:
+        st.info("Bot is OFF. Flip the toggle to give it the mandate — it "
+                "starts scanning immediately and stages its first orders "
+                "for the next open.")
+
+    with st.expander("❓ How the bot works & why it's trustworthy"):
+        st.markdown("""
+**The loop**: every tick it (1) fills yesterday's staged orders at today's real open, (2) walks every open position through the bar — scale ⅓ at +1R (stop→breakeven), scale ⅓ at +2R (stop→+1R), trail the rest at 2.5×ATR, stop out where price actually touched — then (3) scans the universe and stages tomorrow's entries from 5/5-gate setups only.
+
+**The catch-up trick**: the rules are bar-mechanical with next-open execution, so replaying missed days is *identical* to having watched them live. The bot being "asleep" while the site is closed costs nothing.
+
+**Why paper first is non-negotiable**: this ledger becomes the statistical evidence (the 🔬 Validation Lab can audit it) that decides whether the logic deserves a real broker API. Bots don't get promoted on enthusiasm — they get promoted on a verified record. ⚠️ The free server wipes files on redeploy; like the journal, the bot's memory resets then — one more reason its early life is paper-only.
 """)
 
 # ===========================================================================
@@ -861,6 +985,52 @@ with tab_runner:
                             **PLOTLY_LAYOUT)
         st.plotly_chart(figrn, use_container_width=True)
 
+        # ---- 🗣️ Decision feed — the machine narrates itself -----------------
+        st.markdown("#### 🗣️ Decision feed — the machine explains every move")
+        ev_feed = res["events"].iloc[::-1].head(10)
+        ICONS = {"ENTRY": "🟢", "SCALE": "💰", "TARGET": "🎯",
+                 "STOP": "🛑", "BREAKEVEN": "🟡", "TRAIL": "📉",
+                 "SIGNAL": "🔵", "TIME": "⏰"}
+        for _, e_ in ev_feed.iterrows():
+            ic = next((v for k, v in ICONS.items() if k in e_["event"]), "•")
+            is_entry = "ENTRY" in e_["event"]
+            cls = "reason-pro" if is_entry or "SCALE" in e_["event"] \
+                or "TARGET" in e_["event"] else "reason-con"
+            st.markdown(
+                f"<div class='{cls}' style=\"font-family:'JetBrains Mono',"
+                f"monospace\">{ic} <b>{e_['date']}</b> · {e_['event']} · "
+                f"{e_['shares']} sh @ ${e_['price']:,.2f}<br>"
+                f"<span style='color:#8b98a5'>saw: score {e_['score']:+.2f} · "
+                f"BX {e_['bx']} · RSI2 {e_.get('rsi2','—')}</span><br>"
+                f"→ {e_['note']}</div>", unsafe_allow_html=True)
+
+        # ---- 🧾 Deal ledger — full closure reports ---------------------------
+        if len(res.get("closures", [])):
+            st.markdown("#### 🧾 Deal ledger — every round-trip, fully "
+                        "accounted")
+            cl = res["closures"]
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Round-trips", len(cl))
+            k2.metric("Won", f"{float((cl['P&L $']>0).mean())*100:.0f}%")
+            k3.metric("Avg return on capital",
+                      f"{float(cl['return on capital %'].mean()):+.2f}%")
+            k4.metric("Total realized P&L",
+                      f"${float(cl['P&L $'].sum()):+,.0f}")
+            st.dataframe(cl.iloc[::-1], use_container_width=True,
+                         hide_index=True, height=320)
+
+        # ---- 🎓 What the machine learned -------------------------------------
+        if res.get("lessons"):
+            st.markdown("#### 🎓 What the machine learned on this ticker")
+            for L in res["lessons"]:
+                cls = "reason-con" if "⚠️" in L else "reason-pro"
+                st.markdown(f"<div class='{cls}'>🎓 {L}</div>",
+                            unsafe_allow_html=True)
+            with st.expander("❓ How the self-learning works"):
+                st.markdown("""
+After every run the machine audits its own closed trades on this ticker and derives lessons **from data, not vibes**: which exit types made vs cost money, whether entries with strong B-X confirmation outperformed weak ones, the win rate and average return **on deployed capital** per round-trip, and the time-asymmetry check — if losers are held longer than winners, that's the single most common way traders bleed, and the machine will flag itself for it. Every lesson traces to rows you can see in the deal ledger above. This is what "self-learning" honestly means at this scale: measured feedback, not magic.
+""")
+
         st.markdown("#### 📜 The log — every decision, with its reason")
         if len(ev):
             st.dataframe(ev.iloc[::-1], use_container_width=True,
@@ -1053,6 +1223,21 @@ The verdict fuses seven models (trend, momentum, B-Xtrender, MACD, RSI, mean-rev
             if v["verdict"] == "SHORT":
                 st.warning("Shorting needs margin approval at your broker; if "
                            "unavailable, treat SHORT as **avoid / exit longs**.")
+            if v["verdict"] == "LONG":
+                if st.button(f"📒 Track this trade ({tkr}: {v['shares']} sh, "
+                             f"stop ${v['stop']:,.2f})", key="desk_rec"):
+                    _plan1 = pd.DataFrame([{
+                        "ticker": tkr, "shares": v["shares"],
+                        "entry ~": v["entry"], "stop": v["stop"],
+                        "target": v["target"],
+                        "conviction": v["conviction"]}])
+                    _jj = load_journal()
+                    _jj, _n = record_plan(_jj, _plan1, reg["regime"],
+                                          float(account))
+                    save_journal(_jj)
+                    st.success(f"Recorded {tkr} to the 📒 Track record "
+                               f"(UTC-stamped, regime: {reg['regime']}). "
+                               f"Export the CSV after your session!")
             with st.expander("❓ How are these levels computed?"):
                 st.markdown("""
 - **Stop** = entry ± 2.5×ATR — wide enough to survive noise, tight enough to cap damage.
@@ -2329,3 +2514,9 @@ with tab_sizing:
                 st.markdown("""
 Buying "$1,000 of each stock" gives a calm stock and a wild stock totally different risk. Sizing by **risk** (account % ÷ stop distance) equalises it. With a small account, ruin-avoidance *is* the strategy — a 50% drawdown needs +100% just to break even. For the mathematically optimal size per trade, see the **Kelly** number in the Trade desk's Monte Carlo section — and then use half of it, like the pros.
 """)
+
+
+st.markdown("---")
+st.caption("QuantSignal v25 · data: Yahoo Finance (delayed) · educational "
+           "tool, not financial advice · every model documented in its ❓ "
+           "expander · built for one very persistent trader 🇮🇱")
