@@ -23,6 +23,7 @@ from quant.flow import gex_profile, gex_summary, unusual_flow
 from quant.scanner import RISK_PROFILES, scan_setups
 from quant.seasonality import fundamental_snapshot, monthly_seasonality
 from quant.levels import fib_levels, hurst
+from quant.lse import fetch_candles_lse, probe
 from quant.live import live_quote, market_status, patch_live_bar
 from quant.journal import (journal_from_csv, journal_to_csv, load_journal,
                            mark_to_market, record_plan, save_journal)
@@ -322,6 +323,53 @@ if cmd:
                        "playbook · `TICKER VOL` volatility · `SCAN`")
     except Exception:
         st.warning("Command failed (data throttled?) — try again.")
+
+with st.expander("🔌 Data sources — free LSE API (experimental, kills the "
+                 "Yahoo rate limit)"):
+    st.markdown("**London Strategic Edge** (londonstrategicedge.com) offers a "
+                "free-key API: candles, options chains **with greeks**, "
+                "options flow, macro. A working key here = no more shared-IP "
+                "throttling. Get a free key on their site, then:")
+    l1, l2 = st.columns([2, 1])
+    st.session_state["lse_key"] = l1.text_input(
+        "LSE API key", value=st.session_state.get("lse_key", ""),
+        type="password", key="lse_key_in")
+    lse_base = l2.text_input("Base URL (optional — from their docs)",
+                             key="lse_base",
+                             placeholder="https://api.londonstrategicedge.com")
+    cA, cB = st.columns(2)
+    if cA.button("🧪 Test connection (probes endpoint patterns)",
+                 key="lse_probe"):
+        if not st.session_state["lse_key"]:
+            st.warning("Paste your free key first.")
+        else:
+            with st.spinner("Probing candidate endpoints…"):
+                res = probe(st.session_state["lse_key"],
+                            extra_base=lse_base or None)
+            hits = [r for r in res if r["ok"]]
+            if hits:
+                st.success(f"✅ CONNECTED — working pattern found "
+                           f"({hits[0]['auth']} auth). LSE fetch is now "
+                           f"available this session.")
+            else:
+                st.warning("No candidate pattern responded 200. Open their "
+                           "API docs in your browser, copy ONE example "
+                           "request URL (the curl line for candles), paste "
+                           "it into the Base URL box exactly, and re-test — "
+                           "or send it to me/Claude Code and we lock it in "
+                           "permanently.")
+                st.dataframe(pd.DataFrame(res).head(10),
+                             use_container_width=True, hide_index=True)
+    if cB.button("📈 Demo: fetch AAPL via LSE", key="lse_demo"):
+        d_ = fetch_candles_lse("AAPL", "1d")
+        if len(d_):
+            st.success(f"LSE returned {len(d_)} AAPL bars "
+                       f"({d_.index[0].date()} → {d_.index[-1].date()}) — "
+                       f"pipeline works.")
+            st.line_chart(d_["Close"].iloc[-252:])
+        else:
+            st.info("No data — run the connection test first (or the "
+                    "pattern needs their docs' exact URL).")
 st.write("")
 
 PLOTLY_LAYOUT = dict(paper_bgcolor="rgba(0,0,0,0)",
