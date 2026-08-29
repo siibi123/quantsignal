@@ -1,0 +1,1476 @@
+"""QuantTrader core test suite — every safety claim, verified."""
+import dataclasses
+import os, sys, time, shutil, json
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ISOLATION: every test-created file lives under runtime/_test/, never at
+# runtime/'s own root (audit.jsonl, broker.json, strategy_registry.json,
+# circuit_breaker.json, universe.json) -- those are app.py's live paper-
+# trading state. AuditLog(bus)/PaperBroker(...) below with no `path=`
+# would otherwise resolve to the exact same defaults app.py uses, and
+# `shutil.rmtree("runtime")` used to delete the whole directory on every
+# test run -- on a dev machine that's also running the real app, that
+# wiped real trading/audit history. Never widen this back to "runtime".
+shutil.rmtree("runtime/_test", ignore_errors=True)
+
+# Pin the gist singleton to a disabled store so a developer machine (or
+# CI) with GITHUB_TOKEN in the environment cannot upload test fixtures
+# to a real gist.
+from core.gist_store import GistStore as _GistStore, reset_gist_store as _reset_gs
+_reset_gs(_GistStore(token="", runtime_dir="runtime"))
+
+import numpy as np
+import pandas as pd
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from core.state import Config, Event, EventBus, GlobalState, market_status
+from core.engine import AuditLog, Order, PaperBroker, RiskEngine
+from data.providers import (CompositeProvider, FakeProvider, LSEProvider,
+                            PollingFeed, filter_price_outliers)
+from ai.orchestrator import LLMOrchestrator, RuleOrchestrator
+from quant.hmm_regime import fit_hmm
+from quant.kalman_pairs import kalman_hedge_ratio, pair_signal
+from quant.garch import garch_forecast
+from quant.covariance import shrunk_covariance, min_variance_weights
+from quant.vol_surface import build_surface_grid
+from quant.surface_interpreter import interpret_surface
+from quant.anomaly_library import match_anomalies
+from quant.sector_engine import rank_sectors_and_names, score_name
+from quant.orderflow import bulk_volume_classification, cvd, vpin, volume_profile
+from quant.optionflow import flow_spike, largest_prints, premium_share
+from quant.flow_confluence import confluence
+from quant.validation import bootstrap_mean_return
+from core.strategy_registry import MIN_SIGNALS_TO_PROMOTE, StrategyRegistry
+from core.circuit_breaker import DrawdownCircuitBreaker
+from quant.transaction_costs import corwin_schultz_spread, expected_trade_cost
+from quant.regime_gate import REGIME_POLICY, classify_regime
+from quant.execution_quality import slippage_report
+from quant.correlation_monitor import CORRELATION_POLICY, correlation_regime
+from quant.portfolio_stress import risk_budget_from_stress, simulate_portfolio
+from quant.daily_report import render_report
+from data.news import NewsProvider
+
+results = []
+def check(name, cond):
+    results.append((name, bool(cond)))
+    print(f"{'PASS' if cond else 'FAIL'} {name}")
+
+cfg = Config()
+bus = EventBus()
+state = GlobalState(bus)
+audit = AuditLog(bus, path="runtime/_test/audit.jsonl")
+
+# ---- 1. Event bus
+got = []
+bus.subscribe("tick", lambda e: got.append(e))
+bus.publish(Event("tick", {"symbol": "X", "price": 1}))
+check("bus: subscriber receives event", len(got) == 1)
+bus.subscribe("*", lambda e: got.append(e))
+bus.publish(Event("other", {}))
+check("bus: wildcard subscription", any(e.type == "other" for e in got))
+
+# ---- 2. Global state
+seen = []
+bus.subscribe("state.changed", lambda e: seen.append(e.payload["path"]))
+state.set("quotes.AAPL", {"price": 200.5})
+check("state: dot-path set/get", state.get("quotes.AAPL")["price"] == 200.5)
+check("state: mutation emits event", "quotes.AAPL" in seen)
+state.set("portfolio", {"cash": 10000})
+ctx = state.to_ai_context()
+check("state: AI context includes curated keys",
+      "quotes" in ctx and "portfolio" in ctx and len(ctx) < 6001)
+
+# ---- 3. Paper broker accounting
+broker = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker.json")
+o = Order("AAPL", "BUY", 10, reason="test"); o.approved = True
+f1 = broker.execute(o, 100.0)
+check("broker: buy fills with slippage", f1 and f1["price"] > 100.0)
+check("broker: cash reduced correctly",
+      abs(broker.cash - (10000 - 10 * f1["price"] - f1["fee"])) < 0.01)
+o2 = Order("AAPL", "SELL", 10, reason="test"); o2.approved = True
+f2 = broker.execute(o2, 110.0)
+check("broker: sell realizes P&L", f2 and f2["realized"] > 0)
+check("broker: position closed", "AAPL" not in broker.positions)
+o3 = Order("AAPL", "BUY", 5, reason="no stamp")   # NOT approved
+check("broker: refuses unapproved order", broker.execute(o3, 100.0) is None)
+
+# ---- 4. Risk engine veto
+risk = RiskEngine(cfg, bus, state, audit)
+big = Order("NVDA", "BUY", 1000, reason="oversize")        # >> 25% cap
+big = risk.review(big, broker, 100.0)
+check("risk: vetoes oversized position", not big.approved and big.veto_reason)
+ok_ = Order("NVDA", "BUY", 10, reason="sane size")
+ok_ = risk.review(ok_, broker, 100.0)
+check("risk: approves sane order", ok_.approved)
+vetoes = [e for e in bus.recent(50, "risk.veto")]
+check("risk: veto published to bus", len(vetoes) >= 1)
+
+# ---- 5. Audit trail
+tail = audit.tail(50)
+check("audit: records exist with reasoning",
+      len(tail) >= 4 and all("reasoning" in r for r in tail))
+check("audit: persisted to disk", os.path.exists("runtime/_test/audit.jsonl"))
+
+# ---- 6. Orchestrator end-to-end on fake data (uptrend -> should trade)
+prov = FakeProvider(mu=0.002, vol=0.008)
+orch = RuleOrchestrator(bus, state, audit, risk, broker, prov)
+sig = orch.analyze("TREND")
+check("orchestrator: analysis has reasoning", len(sig["why"]) > 10)
+fills = orch.step(["TREND"], risk_pct=1.0)
+check("orchestrator: full propose->veto->execute loop",
+      isinstance(fills, list))
+check("orchestrator: signal in global state",
+      state.get("signals.TREND") is not None)
+
+# ---- 7. LLM socket refuses to fake it
+try:
+    LLMOrchestrator(api_key="")
+    check("llm: refuses without key", False)
+except RuntimeError:
+    check("llm: refuses without key", True)
+
+# ---- 8. Polling feed (fake provider, fast interval)
+# market_hours_gate=False: this test verifies tick-delivery thread
+# mechanics, not real wall-clock market hours (see P8 tests for that).
+feed = PollingFeed(bus, state, FakeProvider(), ["AAA", "BBB"], interval_s=1,
+                   market_hours_gate=False)
+n_before = len(bus.recent(200, "tick"))
+feed.start()
+time.sleep(2.5)
+feed.stop()
+n_after = len(bus.recent(200, "tick"))
+check("feed: background thread publishes ticks", n_after > n_before)
+check("feed: quotes land in state", state.get("quotes.AAA") is not None)
+check("feed: stop() halts cleanly", not feed.running)
+
+# ---- 9. Composite fallback
+comp = CompositeProvider([FakeProvider(), FakeProvider()], state)
+df = comp.get_candles("ZZZ")
+check("composite: fallback chain serves data", len(df) > 100)
+
+# ---- 10. P1a: LSE quote % change vs previous DAILY close, not 1m bar-to-bar
+lse = LSEProvider(api_key="dummy-key-for-test")
+
+def _fake_candles(symbol, interval="1d", lookback="2y"):
+    if interval == "1m":
+        idx = pd.date_range("2026-01-05 15:59", periods=2, freq="1min")
+        return pd.DataFrame({"Open": [101.0, 101.02], "High": [101.05, 101.05],
+                             "Low": [100.95, 101.0], "Close": [101.0, 101.02],
+                             "Volume": [1000, 1000]}, index=idx)
+    idx = pd.date_range("2026-01-01", periods=3, freq="D")
+    return pd.DataFrame({"Open": [95.0, 98.0, 100.0], "High": [96.0, 99.0, 101.0],
+                         "Low": [94.0, 97.0, 99.0], "Close": [95.0, 98.0, 100.0],
+                         "Volume": [5000, 5000, 5000]}, index=idx)
+
+lse.get_candles = _fake_candles
+q = lse.get_quote("TEST")
+expected_chg = round((101.02 / 98.0 - 1) * 100, 2)      # vs previous daily close
+wrong_chg = round((101.02 / 101.0 - 1) * 100, 2)         # the old, buggy 1m-bar delta
+check("lse: quote % change vs previous daily close, not 1m bar",
+      abs(q["chg_pct"] - expected_chg) < 0.001)
+check("lse: quote % change is not the old bar-to-bar delta",
+      abs(q["chg_pct"] - wrong_chg) > 0.5)
+
+# ---- 11. P1b: AUM + max position size veto (fixed $ and % of AUM modes)
+risk2 = RiskEngine(cfg, bus, state, audit)
+broker2 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_test2.json")
+
+risk2.cfg = dataclasses.replace(cfg, max_position_mode="fixed",
+                                max_position_fixed_usd=500.0)
+big_fixed = risk2.review(Order("AAPL", "BUY", 20, reason="test fixed cap"),
+                         broker2, 100.0)                 # notional $2000 > $500 cap
+check("risk: fixed $ position cap vetoes oversized order",
+      not big_fixed.approved and "max position size" in big_fixed.veto_reason)
+small_fixed = risk2.review(Order("AAPL", "BUY", 3, reason="test fixed cap ok"),
+                           broker2, 100.0)                # notional $300 < $500 cap
+check("risk: fixed $ position cap approves order within cap", small_fixed.approved)
+
+risk2.cfg = dataclasses.replace(cfg, max_position_mode="pct",
+                                max_position_pct=10.0, aum=1000.0)
+aum_big = risk2.review(Order("MSFT", "BUY", 5, reason="test aum pct cap"),
+                       broker2, 100.0)   # notional $500 vs 10% of $1000 AUM = $100 cap
+check("risk: AUM-based %% cap uses declared AUM, not live equity",
+      not aum_big.approved)
+aum_ok = risk2.review(Order("MSFT", "BUY", 1, reason="test aum pct cap ok"),
+                      broker2, 50.0)     # notional $50 <= $100 cap
+check("risk: AUM-based %% cap approves order within cap", aum_ok.approved)
+
+# ---- 12. P2: hmm_regime — Gaussian HMM regime detection
+_rng = np.random.default_rng(3)
+_bull = _rng.normal(0.0015, 0.006, 200)
+_bear = _rng.normal(-0.003, 0.02, 200)
+_hmm_r = pd.Series(np.concatenate([_bull, _bear]),
+                   index=pd.bdate_range("2023-01-01", periods=400))
+_hmm = fit_hmm(_hmm_r, n_states=2)
+check("hmm: states sorted by mean, current regime matches the bear tail",
+      _hmm["state_means_pct"][0] < _hmm["state_means_pct"][1]
+      and _hmm["most_likely_regime"] == "Bear/Panic")
+check("hmm: transition matrix is diagonal-dominant (regimes persist)",
+      all(_hmm["transition_matrix"][i][i] > 0.9 for i in range(2)))
+
+# ---- 13. P2: kalman_pairs — dynamic hedge ratio + spread z-score
+_rng2 = np.random.default_rng(5)
+_n = 300
+_x = np.cumsum(_rng2.normal(0.1, 1, _n)) + 100
+_y = 2.0 * _x + _rng2.normal(0, 0.3, _n)
+_idx = pd.bdate_range("2023-01-01", periods=_n)
+_xs, _ys = pd.Series(_x, index=_idx), pd.Series(_y, index=_idx)
+_kf = kalman_hedge_ratio(_ys, _xs)
+check("kalman: recovers the true hedge ratio (beta ~= 2.0)",
+      abs(float(_kf["beta"].iloc[-1]) - 2.0) < 0.2)
+_y_shock = _y.copy()
+_y_shock[-1] += 20                                    # one isolated spread shock
+_sig = pair_signal(pd.Series(_y_shock, index=_idx), _xs)
+check("kalman: isolated spread shock triggers a SHORT SPREAD signal",
+      _sig["signal"] == "SHORT SPREAD" and _sig["spread_z"] > 5)
+
+# ---- 14. P2: garch — GARCH(1,1) volatility forecast (arch package)
+_rng3 = np.random.default_rng(11)
+_ng, _omega, _a1, _b1 = 800, 0.02, 0.1, 0.85
+_eps, _sig2 = np.zeros(_ng), np.zeros(_ng)
+_sig2[0] = _omega / (1 - _a1 - _b1)
+_z = _rng3.standard_normal(_ng)
+_eps[0] = np.sqrt(_sig2[0]) * _z[0]
+for _t in range(1, _ng):
+    _sig2[_t] = _omega + _a1 * _eps[_t - 1] ** 2 + _b1 * _sig2[_t - 1]
+    _eps[_t] = np.sqrt(_sig2[_t]) * _z[_t]
+_close = pd.Series(100 * np.exp(np.cumsum(_eps / 100)),
+                   index=pd.bdate_range("2022-01-01", periods=_ng))
+_gf = garch_forecast(_close)
+check("garch: fits a simulated GARCH(1,1) series without error",
+      "error" not in _gf and _gf["vol_1d_pct"] > 0)
+check("garch: recovers a stationary, sensible persistence estimate",
+      _gf["persistence"] is not None and 0 < _gf["persistence"] < 1
+      and _gf["half_life_days"] is not None)
+
+# ---- 15. P2: covariance — Ledoit-Wolf shrinkage + min-variance weights
+_rng4 = np.random.default_rng(2)
+_cov_r = pd.DataFrame(
+    {"LOWVOL": _rng4.normal(0, 0.005, 300), "HIGHVOL": _rng4.normal(0, 0.02, 300)},
+    index=pd.bdate_range("2023-01-01", periods=300))
+_sc = shrunk_covariance(_cov_r)
+check("covariance: Ledoit-Wolf shrinkage intensity is a valid fraction",
+      "error" not in _sc and 0 <= _sc["shrinkage"] <= 1)
+_mv = min_variance_weights(_cov_r)
+check("covariance: min-variance portfolio tilts toward the lower-vol asset",
+      abs(sum(_mv["weights"].values()) - 1) < 0.01
+      and _mv["weights"]["LOWVOL"] > _mv["weights"]["HIGHVOL"])
+
+# ---- 16. P3: vol_surface — strike x DTE x IV grid
+_spot = 100.0
+_chain_rows = []
+for _k in [80, 85, 90, 95, 100, 105, 110, 115, 120]:
+    _iv = 0.20 + max(0, (_spot - _k)) * 0.006          # steep put-side skew
+    _chain_rows.append({"strike": _k, "dte": 7, "iv": round(_iv, 4),
+                        "type": "C" if _k >= _spot else "P",
+                        "delta": (0.5 - (_k - _spot) / 100) if _k >= _spot
+                                else (-0.5 - (_k - _spot) / 100)})
+for _k in [80, 90, 100, 110, 120]:
+    _chain_rows.append({"strike": _k, "dte": 60, "iv": 0.16,
+                        "type": "C" if _k >= _spot else "P",
+                        "delta": (0.5 - (_k - _spot) / 100) if _k >= _spot
+                                else (-0.5 - (_k - _spot) / 100)})
+_chain = pd.DataFrame(_chain_rows)
+_grid = build_surface_grid(_chain)
+check("vol_surface: grid shape matches distinct DTEs x strikes",
+      _grid["dtes"] == [7, 60] and len(_grid["strikes"]) == 9
+      and len(_grid["iv_grid"]) == 2)
+check("vol_surface: missing iv/dte columns fails honestly, no fake grid",
+      "error" in build_surface_grid(pd.DataFrame({"strike": [100]})))
+
+# ---- 17. P3: surface_interpreter — skew + term structure + smile anomaly
+_surf = interpret_surface(_chain, spot=_spot)
+check("surface_interpreter: detects the steep put skew built into the data",
+      _surf["skew_pts"] is not None and _surf["skew_pts"] > 5
+      and any("Steep put skew" in f for f in _surf["findings"]))
+check("surface_interpreter: detects the term-structure inversion (7d rich vs 60d)",
+      _surf["term_structure_pts"] is not None and _surf["term_structure_pts"] > 3
+      and any("INVERTED" in f for f in _surf["findings"]))
+
+_smile_rows = [{"strike": k, "dte": 10,
+               "iv": 0.35 if k == 95 else 0.20,           # single-strike anomaly
+               "type": "C" if k >= 100 else "P"}
+              for k in [85, 90, 95, 100, 105, 110, 115]]
+_smile = interpret_surface(pd.DataFrame(_smile_rows), spot=100.0)
+check("surface_interpreter: flags a single-strike smile anomaly",
+      len(_smile["smile_anomalies"]) == 1
+      and _smile["smile_anomalies"][0]["strike"] == 95.0)
+
+# ---- 18. P3: ingest_chain wires the surface read into state + audit
+_orch3 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider())
+_ing = _orch3.ingest_chain("SURF", _chain)
+check("ingest_chain: surface findings attached to the options state entry",
+      "surface" in _ing and len(_ing["surface"]["findings"]) >= 1)
+check("ingest_chain: VOL SURFACE audit record created",
+      any(r["action"] == "VOL SURFACE" for r in audit.tail(20)))
+
+# ---- 19. P4: NewsProvider stub (no key -> honest empty, never fabricated)
+_news_stub = NewsProvider(api_key="")
+check("news: no key -> empty headlines/sentiment, not fabricated",
+      _news_stub.company_news("AAPL") == [] and _news_stub.sentiment("AAPL") == {}
+      and not _news_stub.working)
+
+# ---- 20. P4: anomaly_library — trigger matching is honest (empty context -> nothing)
+check("anomaly_library: momentum trigger fires on a strong agreeing score",
+      any(a["name"] == "Momentum"
+          for a in match_anomalies({"score": 0.5, "agree_frac": 0.9})))
+check("anomaly_library: empty context matches nothing (no fabricated triggers)",
+      match_anomalies({}) == [])
+
+# ---- 21. P4: LSEProvider macro_series / economic_calendar / options_flow parsing
+def _fake_lse_get(path, params):
+    if path == "/series":
+        sym = params.get("symbol")
+        return [{"date": "2026-07-01", "value": 3.1 if sym == "cpi_yoy" else 5.33},
+                {"date": "2026-06-01", "value": 3.0}]
+    if path == "/ref/economic_calendar":
+        return [{"event": "CPI m/m", "date": "2026-07-15"},
+                {"event": "FOMC Rate Decision", "date": "2026-07-30"}]
+    if path == "/options/flow":
+        return [{"strike": 200, "type": "call", "premium": 150000, "expiry": "2026-08-21"},
+                {"strike": 195, "type": "put", "premium": 120000, "expiry": "2026-08-21"}]
+    return None
+
+lse4 = LSEProvider(api_key="dummy-key-for-test")
+lse4._get = _fake_lse_get
+_mv = lse4.macro_series("cpi_yoy")
+check("lse: macro_series parses (date, value) rows",
+      len(_mv) == 2 and float(_mv["value"].iloc[0]) == 3.1)
+_cal = lse4.economic_calendar(region="US")
+check("lse: economic_calendar returns upcoming events",
+      len(_cal) == 2 and "event" in [c.lower() for c in _cal.columns])
+_flow = lse4.options_flow(underlying="AAPL", min_premium=100000)
+check("lse: options_flow parses strike/type/premium rows",
+      len(_flow) == 2 and float(_flow["premium"].iloc[0]) == 150000)
+
+# ---- 22. P4: RuleOrchestrator news/macro/flow scans wire into state+audit+bus
+news4 = NewsProvider(api_key="dummy-key-for-test")
+news4.company_news = lambda symbol, days=3, limit=10: [
+    {"symbol": symbol, "headline": "Big beat on earnings", "source": "Reuters",
+     "url": "", "ts": 0}]
+news4.sentiment = lambda symbol: {"symbol": symbol, "bullish_pct": 82.0,
+                                  "bearish_pct": 10.0, "buzz_articles_week": 40,
+                                  "buzz_z": 1.2}
+orch4 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider(),
+                         news=news4, lse=lse4)
+
+n_news = len(bus.recent(500, "news.interrupt"))
+out_news = orch4.scan_news("AAPL")
+check("scan_news: headlines+sentiment land in state.news",
+      state.get("news.AAPL") is not None and out_news["bullish_pct"] == 82.0)
+check("scan_news: strong sentiment publishes a news.interrupt event",
+      len(bus.recent(500, "news.interrupt")) > n_news)
+
+out_macro = orch4.scan_macro()
+check("scan_macro: rates/CPI snapshot + calendar land in state.macro",
+      state.get("macro.cpi_yoy.latest") == 3.1
+      and len(out_macro.get("upcoming_events", [])) == 2)
+
+n_flow = len(bus.recent(500, "flow.interrupt"))
+out_flow = orch4.scan_flow("AAPL", min_premium=100000)
+check("scan_flow: large prints land in state.flow_alerts + publish an interrupt",
+      len(out_flow["prints"]) == 2 and len(bus.recent(500, "flow.interrupt")) > n_flow)
+
+_res4 = orch4.research("P4TEST")
+check("research: core EWMA/MC fields still present after anomaly wiring",
+      {"ewma_ann_vol_pct", "p_up_20d_pct", "exp_move_20d"} <= set(_res4.keys()))
+
+# ---- 23. P5: sector_engine — score_name tilts + rank_sectors_and_names
+def _mk_df(mu, vol, n=300, seed=1):
+    rr_ = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(rr_.normal(mu, vol, n)))
+    return pd.DataFrame({"Open": close, "High": close * 1.01, "Low": close * 0.99,
+                        "Close": close, "Volume": 1e6},
+                        index=pd.bdate_range("2024-01-01", periods=n))
+
+_strong_up = _mk_df(0.0025, 0.01, seed=1)
+_base = score_name(_strong_up)
+_tilted = score_name(_strong_up, sentiment={"bullish_pct": 90, "bearish_pct": 5},
+                    flow={"prints": [{"strike": 100}]}, macro_trend="down")
+check("sector_engine: bullish sentiment+flow+dovish macro all tilt score up "
+      "on a LONG verdict",
+      _base["verdict"] == "LONG" and _tilted["target_score"] > _base["target_score"])
+
+_data = {"AAA": _mk_df(0.0025, 0.01, seed=1), "BBB": _mk_df(0.0022, 0.011, seed=2),
+         "CCC": _mk_df(-0.0005, 0.02, seed=3)}
+_sectors5 = {"AAA": "Tech", "BBB": "Tech", "CCC": "Energy"}
+_scan = rank_sectors_and_names(_data, _sectors5,
+                               sentiment_by_ticker={"AAA": {"bullish_pct": 85,
+                                                            "bearish_pct": 5}},
+                               macro_trend="down")
+check("sector_engine: only tradeable names are ranked, the rest land in avoid",
+      len(_scan["names"]) + len(_scan["avoid"]) == 3
+      and all(n["verdict"] != "NO TRADE" for n in _scan["names"]))
+check("sector_engine: sectors are ranked by average target_score",
+      _scan["sectors"] == sorted(_scan["sectors"],
+                                 key=lambda x: -x["avg_target_score"]))
+
+# ---- 24. P5: RuleOrchestrator.sector_scan wires state + audit
+orch5 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider())
+_scan5 = orch5.sector_scan(["P5A", "P5B"], account=10000, risk_pct=1.0)
+check("sector_scan: writes state.sector_scan and a SECTOR SCAN audit record",
+      state.get("sector_scan") is not None
+      and any(r["action"] == "SECTOR SCAN" for r in audit.tail(20)))
+check("sector_scan: reports n_requested (full scan size) alongside "
+      "n_scanned, and the SECTOR SCAN audit shows both",
+      _scan5["n_requested"] == 2
+      and any(r["action"] == "SECTOR SCAN"
+             and f"Scanned {_scan5['n_scanned']}/2 names" in r["reasoning"]
+             for r in audit.tail(20)))
+
+# ---- 25. P6a: orderflow — BVC/CVD confirms a healthy uptrend
+_rng6 = np.random.default_rng(9)
+_n6 = 200
+_close6 = 100 * np.exp(np.cumsum(_rng6.normal(0.002, 0.008, _n6)))
+_vol6 = np.abs(1e6 + _rng6.normal(0, 1e5, _n6))
+_df6 = pd.DataFrame({"Open": _close6, "High": _close6 * 1.005,
+                    "Low": _close6 * 0.995, "Close": _close6, "Volume": _vol6},
+                    index=pd.bdate_range("2024-01-01", periods=_n6))
+_cvd6 = cvd(_df6)
+check("orderflow: CVD confirms a healthy uptrend (no divergence)",
+      _cvd6["cvd_chg"] > 0 and _cvd6["divergence"] is None)
+
+# same series but the last 20 bars get low volume on up-closes, high on down-closes
+_close7 = _close6.copy(); _vol7 = _vol6.copy()
+for i in range(_n6 - 20, _n6):
+    _vol7[i] = 2e5 if _close7[i] > _close7[i - 1] else 2e6
+_df7 = pd.DataFrame({"Open": _close7, "High": _close7 * 1.005,
+                    "Low": _close7 * 0.995, "Close": _close7, "Volume": _vol7},
+                    index=pd.bdate_range("2024-01-01", periods=_n6))
+check("orderflow: CVD flags a bearish divergence when volume contradicts price",
+      cvd(_df7)["divergence"] == "bearish")
+
+_rng8 = np.random.default_rng(5)
+_n8 = 150
+_close8 = 100 * np.exp(np.cumsum(_rng8.normal(0.0, 0.005, _n8)))
+_vol8 = np.full(_n8, 1e6)
+_close8[-20:] = _close8[-21] * np.exp(np.cumsum(np.full(20, 0.01)))
+_vol8[-20:] = 5e6
+_df8 = pd.DataFrame({"Open": _close8, "High": _close8 * 1.01, "Low": _close8 * 0.99,
+                    "Close": _close8, "Volume": _vol8},
+                    index=pd.bdate_range("2024-01-01", periods=_n8))
+_vp8 = vpin(_df8)
+check("orderflow: VPIN flags toxicity after a sudden one-directional volume spike",
+      _vp8["toxic"] and _vp8["percentile"] >= 85)
+_prof = volume_profile(_df6)
+check("orderflow: volume_profile returns top-3 nodes, sane volume shares",
+      len(_prof) == 3 and all(0 <= p["volume_pct"] <= 100 for p in _prof))
+
+# ---- 26. P6b: optionflow — premium share, spike z-score, largest prints
+_flow_today = pd.DataFrame([
+    {"strike": 200, "type": "call", "premium": 300000, "volume": 500, "expiry": "2026-08-21"},
+    {"strike": 195, "type": "put", "premium": 100000, "volume": 200, "expiry": "2026-08-21"},
+])
+_ps = premium_share(_flow_today)
+check("optionflow: premium_share splits call/put correctly",
+      abs(_ps["call_share_pct"] + _ps["put_share_pct"] - 100) < 0.01
+      and _ps["call_share_pct"] > _ps["put_share_pct"])
+check("optionflow: flow_spike is honest about insufficient history",
+      "error" in flow_spike(_flow_today, [_flow_today] * 3))
+_rng9 = np.random.default_rng(3)
+_hist9 = [pd.DataFrame([{"strike": 200, "type": "call",
+                        "premium": 60000 + _rng9.normal(0, 10000),
+                        "volume": 150 + _rng9.normal(0, 20)}]) for _ in range(20)]
+_spike9 = flow_spike(pd.DataFrame([{"strike": 200, "type": "call",
+                                   "premium": 300000, "volume": 800}]), _hist9)
+check("optionflow: flow_spike detects a large z-score spike vs the norm",
+      "error" not in _spike9 and _spike9["volume_z"] > 3)
+_top = largest_prints(_flow_today, top_n=1)
+check("optionflow: largest_prints returns the single biggest premium print",
+      len(_top) == 1 and _top[0]["premium"] == 300000)
+
+# ---- 27. P6c: flow_confluence — LONG / CONFLICT / QUIET classification
+_calls_heavy = pd.DataFrame([{"strike": 200, "type": "call", "premium": 400000,
+                             "volume": 500},
+                            {"strike": 195, "type": "put", "premium": 30000,
+                             "volume": 50}])
+_puts_heavy = pd.DataFrame([{"strike": 200, "type": "call", "premium": 30000,
+                            "volume": 50},
+                           {"strike": 195, "type": "put", "premium": 400000,
+                            "volume": 500}])
+check("flow_confluence: bullish tape + call-heavy flow -> CONFLUENCE LONG",
+      confluence(_df6, _calls_heavy)["verdict"] == "CONFLUENCE LONG")
+check("flow_confluence: bullish tape + put-heavy flow -> CONFLICT",
+      confluence(_df6, _puts_heavy)["verdict"] == "CONFLICT")
+_flat = pd.DataFrame({"Open": [100.0] * 60, "High": [100.1] * 60,
+                     "Low": [99.9] * 60, "Close": [100.0] * 60,
+                     "Volume": [1000.0] * 60},
+                     index=pd.bdate_range("2024-01-01", periods=60))
+_neutral_flow = pd.DataFrame([{"strike": 100, "type": "call", "premium": 50000,
+                              "volume": 50},
+                             {"strike": 100, "type": "put", "premium": 50000,
+                              "volume": 50}])
+check("flow_confluence: flat tape + neutral flow -> QUIET",
+      confluence(_flat, _neutral_flow)["verdict"] == "QUIET")
+
+# ---- 28. P6c: RuleOrchestrator.scan_flow_confluence wires state + audit
+orch6 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider())
+_fc6 = orch6.scan_flow_confluence("P6TEST")
+check("scan_flow_confluence: writes state.flow + a FLOW CONFLUENCE audit record",
+      state.get("flow.P6TEST") is not None
+      and any(r["action"] == "FLOW CONFLUENCE" for r in audit.tail(20)))
+
+# ---- 29. P6c: flow-confluence tilt feeds into P5 sector scoring
+# _strong_up (test 23) is already confirmed to produce a LONG verdict.
+_base9 = score_name(_strong_up)
+_agree9 = score_name(_strong_up, flow_confluence={"verdict": "CONFLUENCE LONG"})
+_disagree9 = score_name(_strong_up, flow_confluence={"verdict": "CONFLUENCE SHORT"})
+check("sector_engine: agreeing flow confluence raises target_score, "
+      "disagreeing lowers it",
+      _agree9["target_score"] > _base9["target_score"] > _disagree9["target_score"])
+
+# ---- 30. P7a: bootstrap_mean_return — honest CI on a per-signal edge sample
+_rng10 = np.random.default_rng(1)
+_pos_edge = pd.Series(_rng10.normal(0.02, 0.03, 40))
+_noisy_edge = pd.Series(_rng10.normal(0.0, 0.05, 40))
+check("validation: bootstrap_mean_return excludes zero for a clear positive edge",
+      bootstrap_mean_return(_pos_edge)["excludes_zero"])
+check("validation: bootstrap_mean_return does not exclude zero for a noisy sample",
+      not bootstrap_mean_return(_noisy_edge)["excludes_zero"])
+
+# ---- 31. P7a: StrategyRegistry — log/settle/promote lifecycle
+reg1 = StrategyRegistry(audit, path="runtime/_test/registry_p7a.json")
+check("strategy_registry: starts every strategy in INCUBATION",
+      reg1.status("s1") == StrategyRegistry.STATUS_INCUBATION)
+for _ in range(MIN_SIGNALS_TO_PROMOTE + 5):
+    reg1.log_signal("s1", "AAA", "BUY", 100.0, horizon_days=10)
+for s in reg1._data["s1"]["signals"]:
+    s["ts"] = time.time() - 11 * 86400              # simulate elapsed horizon
+n_settled = reg1.settle_signals("s1", price_lookup=lambda sym: 106.0)  # +6% each
+check("strategy_registry: settle_signals marks due signals settled",
+      n_settled == MIN_SIGNALS_TO_PROMOTE + 5
+      and reg1.signal_counts("s1")["pending"] == 0)
+promo1 = reg1.evaluate_promotion("s1")
+check("strategy_registry: promotes INCUBATION -> PAPER on a clear settled edge",
+      promo1["decision"] == "PROMOTE"
+      and reg1.status("s1") == StrategyRegistry.STATUS_PAPER
+      and any(r["action"] == "PROMOTE" for r in audit.tail(20)))
+
+reg1.log_signal("s2", "BBB", "BUY", 100.0, horizon_days=10)
+promo2 = reg1.evaluate_promotion("s2")
+check("strategy_registry: holds in INCUBATION with too few settled signals",
+      promo2["decision"] == "NOT ENOUGH SIGNALS"
+      and reg1.status("s2") == StrategyRegistry.STATUS_INCUBATION)
+
+# ---- 32. P7a: RuleOrchestrator.step() enforces the gate; exits are never gated
+reg7 = StrategyRegistry(audit, path="runtime/_test/registry_p7a_orch.json")
+orch7 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider(),
+                         registry=reg7)
+# isolate this test from P7c's regime gate (FakeProvider's synthetic path
+# per symbol depends on Python's per-process hash randomization, so which
+# regime a given test symbol lands in isn't stable across runs)
+orch7._regime_gate = lambda symbol: {"regime": "Bull",
+                                     "policy": REGIME_POLICY["Bull"]}
+# same isolation for P7f: the shared `broker` accumulates positions across
+# this whole file, so a real correlation_monitor() call here would depend
+# on whatever's held by the time this test runs -- not what's under test.
+orch7.correlation_monitor = lambda: {"policy": CORRELATION_POLICY["normal"]}
+orch7.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 5,
+    "why": "test forced buy", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY",
+    "gates": "5/5"}
+# 0 logged signals: auto-bypass is forced ON even if the caller passes False
+# (this is the Streamlit Cloud / AAPL-shows-BUY-but-no-fill fix).
+f_auto = orch7.step(["P7AAUTO"], risk_pct=1.0, bypass_incubation=False)
+check("step(): auto-bypasses INCUBATION until 20 signals are logged",
+      len(f_auto) == 1 and "P7AAUTO" in broker.positions
+      and any(r["action"] == "PROPOSE BUY"
+             and r.get("data", {}).get("incubation_bypassed") is True
+             for r in audit.tail(20)))
+
+while reg7.signal_counts(orch7.STRATEGY_NAME)["total"] < MIN_SIGNALS_TO_PROMOTE:
+    reg7.log_signal(orch7.STRATEGY_NAME, "SEEDLOG", "BUY", 100.0, horizon_days=10)
+check("strategy_registry: 20 logged signals reach the auto-bypass threshold",
+      reg7.signal_counts(orch7.STRATEGY_NAME)["total"] >= MIN_SIGNALS_TO_PROMOTE)
+
+f1 = orch7.step(["P7AENTRY"], risk_pct=1.0, bypass_incubation=False)
+check("step(): INCUBATION blocks a new BUY once 20 signals are logged and bypass is off",
+      len(f1) == 0 and "P7AENTRY" not in broker.positions
+      and any(r["action"] == "SIGNAL LOGGED (INCUBATION)"
+             for r in audit.tail(20)))
+
+# bypass toggle (owner-facing INCUBATION escape hatch, sidebar-controlled
+# default ON): the same INCUBATION strategy, but the caller now asks to
+# skip the P7a hold-back so entries actually place.
+f1b = orch7.step(["P7ABYPASS"], risk_pct=1.0, bypass_incubation=True)
+check("step(): bypass_incubation=True executes a new BUY despite INCUBATION",
+      len(f1b) == 1 and "P7ABYPASS" in broker.positions
+      and any(r["action"] == "PROPOSE BUY"
+             and r.get("data", {}).get("incubation_bypassed") is True
+             for r in audit.tail(20)))
+
+broker.positions["P7AEXIT"] = {"qty": 10, "avg_price": 90.0}
+orch7.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "SELL", "price": 95.0,
+    "why": "test forced sell", "urgency": "🟠 TODAY", "mode": "MANAGE",
+    "gates": "3/5"}
+f2 = orch7.step(["P7AEXIT"], risk_pct=1.0)
+check("step(): exits execute even while the strategy is in INCUBATION",
+      len(f2) == 1 and "P7AEXIT" not in broker.positions)
+
+for _ in range(MIN_SIGNALS_TO_PROMOTE + 5):
+    reg7.log_signal(orch7.STRATEGY_NAME, "SEED", "BUY", 100.0, horizon_days=10)
+for s in reg7._data[orch7.STRATEGY_NAME]["signals"]:
+    s["ts"] = time.time() - 11 * 86400
+reg7.settle_signals(orch7.STRATEGY_NAME, price_lookup=lambda sym: 106.0)
+reg7.evaluate_promotion(orch7.STRATEGY_NAME)
+check("step(): strategy promotes to PAPER after enough settled signals with an edge",
+      reg7.status(orch7.STRATEGY_NAME) == StrategyRegistry.STATUS_PAPER)
+
+orch7.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 5,
+    "why": "test forced buy after promotion", "urgency": "🟢 ACTIONABLE",
+    "mode": "ENTRY", "gates": "5/5"}
+f3 = orch7.step(["P7APROMO"], risk_pct=1.0)
+check("step(): once PAPER, new BUY entries execute normally",
+      len(f3) == 1 and "P7APROMO" in broker.positions)
+
+# owner-reported bug (2026-08-02): "AAPL had a BUY signal but no fill
+# appeared in TRADES" -- a BUY signal on an ALREADY-HELD symbol is
+# correct-but-silent behavior (no pyramiding), so it looked like a bug.
+# Now audited so it isn't a silent mystery.
+broker.positions["P7AHELD"] = {"qty": 3, "avg_price": 100.0}
+f4 = orch7.step(["P7AHELD"], risk_pct=1.0)
+check("step(): a BUY signal on an already-held symbol is audited, not silent",
+      len(f4) == 0
+      and any(r["action"] == "SIGNAL IGNORED (ALREADY HELD)"
+             and r["data"]["held_qty"] == 3
+             for r in audit.tail(20)))
+del broker.positions["P7AHELD"]
+
+orch7.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 0,
+    "why": "test tiny size", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY",
+    "gates": "5/5"}
+f5 = orch7.step(["P7AZEROSIZE"], risk_pct=1.0)
+check("step(): a BUY sized to 0 shares after multipliers is audited, not silent",
+      len(f5) == 0
+      and any(r["action"] == "SIGNAL LOGGED (SIZE ROUNDED TO 0)"
+             for r in audit.tail(20)))
+
+# ---- 32b. P9: universe-scale decision cycle -- DECISION CYCLE audit +
+# regime refit budget/cache (quant.hmm_regime's real fit is ~11s/symbol,
+# so step() must never fit fresh regimes for the whole universe every
+# cycle -- see RuleOrchestrator.REGIME_REFIT_BUDGET_PER_CYCLE)
+import ai.orchestrator as _orch_mod
+_regime_fits = {"n": 0}
+def _fake_classify_regime(returns):
+    _regime_fits["n"] += 1
+    return {"regime": "Bull", "policy": REGIME_POLICY["Bull"]}
+_real_classify_regime = _orch_mod.classify_regime
+_orch_mod.classify_regime = _fake_classify_regime
+
+reg9u = StrategyRegistry(audit, path="runtime/_test/registry_universe.json")
+orch16 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider(),
+                          registry=reg9u)
+orch16.correlation_monitor = lambda: {"policy": CORRELATION_POLICY["normal"]}
+orch16.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "NONE", "price": 100.0, "shares": 0,
+    "why": "test scan", "urgency": "—", "mode": "ENTRY", "gates": "0/5"}
+
+_big_universe = [f"UNIVBIG{i}" for i in range(30)]
+orch16.step(_big_universe, risk_pct=1.0, bypass_incubation=True)
+check("step(): DECISION CYCLE audit + state.decision_cycle.last_scan "
+      "record the full symbol count",
+      state.get("decision_cycle.last_scan")["n_symbols"] == 30
+      and any(r["action"] == "DECISION CYCLE"
+             and r["reasoning"] == "Decision cycle: scanning 30 symbols"
+             for r in audit.tail(60)))
+check("step(): regime refits are capped at REGIME_REFIT_BUDGET_PER_CYCLE "
+      "even when the symbol count exceeds it",
+      _regime_fits["n"] == RuleOrchestrator.REGIME_REFIT_BUDGET_PER_CYCLE)
+
+_regime_fits["n"] = 0
+_small_universe = [f"UNIVSMALL{i}" for i in range(10)]
+orch16.step(_small_universe, risk_pct=1.0, bypass_incubation=True)
+check("step(): first pass over a small (under-budget) symbol set fits "
+      "every symbol's regime",
+      _regime_fits["n"] == 10)
+_regime_fits["n"] = 0
+orch16.step(_small_universe, risk_pct=1.0, bypass_incubation=True)
+check("step(): a second cycle within the TTL reuses every cached regime "
+      "-- zero new HMM refits",
+      _regime_fits["n"] == 0)
+
+_orch_mod.classify_regime = _real_classify_regime
+
+# ---- 33. P7e: DrawdownCircuitBreaker — multiplier curve + peak/halt lifecycle
+check("circuit_breaker: gradual multiplier (1.0 -> 0.5 -> 0.0 across 0-10% DD)",
+      DrawdownCircuitBreaker._multiplier(0) == 1.0
+      and DrawdownCircuitBreaker._multiplier(5) == 0.5
+      and DrawdownCircuitBreaker._multiplier(10) == 0.0
+      and DrawdownCircuitBreaker._multiplier(2.5) == 0.75)
+
+cb1 = DrawdownCircuitBreaker(audit, path="runtime/_test/cb1.json")
+s1 = cb1.update(10000)                 # first mark sets the peak
+check("circuit_breaker: first update establishes the peak with no drawdown",
+      s1["peak_equity"] == 10000 and s1["drawdown_pct"] == 0.0
+      and s1["size_multiplier"] == 1.0)
+s2 = cb1.update(9500)                  # 5% drawdown -> half size
+check("circuit_breaker: 5% drawdown cuts size toward 50%",
+      abs(s2["drawdown_pct"] - 5.0) < 0.01 and abs(s2["size_multiplier"] - 0.5) < 0.01)
+s3 = cb1.update(8800)                  # 12% drawdown -> risk-reducing only
+check("circuit_breaker: 10-15% drawdown allows only risk-reducing trades",
+      s3["only_risk_reducing"] and not s3["halted"])
+s4 = cb1.update(8400)                  # 16% drawdown -> hard halt, audited
+check("circuit_breaker: >=15% drawdown trips a sticky HALT",
+      s4["halted"]
+      and any(r["action"] == "CIRCUIT BREAKER TRIPPED" for r in audit.tail(20)))
+s5 = cb1.update(10000)                 # equity fully recovers to the old peak
+check("circuit_breaker: a halt does NOT auto-clear just because equity recovers",
+      cb1.status()["halted"])
+try:
+    cb1.manual_reset("")
+    check("circuit_breaker: manual_reset rejects an empty reason", False)
+except ValueError:
+    check("circuit_breaker: manual_reset rejects an empty reason", True)
+cb1.manual_reset("owner reviewed the drawdown, resuming manually")
+check("circuit_breaker: a reasoned manual_reset clears the halt and is audited",
+      not cb1.status()["halted"]
+      and any(r["action"] == "CIRCUIT BREAKER RESET" for r in audit.tail(20)))
+
+# ---- 34. P7e: RiskEngine defense-in-depth veto when the breaker is tripped
+cb2 = DrawdownCircuitBreaker(audit, path="runtime/_test/cb2.json")
+cb2._data["peak_equity"] = 20000.0     # fabricate a high peak -> instant big drawdown
+broker3 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_cb.json")
+risk3 = RiskEngine(cfg, bus, state, audit, circuit_breaker=cb2)
+halted_buy = risk3.review(Order("HALT", "BUY", 1, reason="test"), broker3, 100.0)
+check("risk: vetoes a BUY when the circuit breaker is HALTED",
+      not halted_buy.approved and "circuit breaker" in halted_buy.veto_reason.lower())
+halted_sell = risk3.review(Order("HALT", "SELL", 1, reason="test"), broker3, 100.0)
+check("risk: circuit breaker checks never apply to SELL (exits stay unblocked)",
+      halted_sell.approved)
+
+# ---- 35. P7e: RuleOrchestrator.step() applies the size multiplier to real orders
+# step() derives equity from the broker's OWN balance each call, so the
+# drawdown must be simulated there, not via a disconnected update() call.
+cb3 = DrawdownCircuitBreaker(audit, path="runtime/_test/cb3.json")
+cb3.update(10000)                      # establish the peak
+broker4 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_cb2.json")
+broker4.cash = 9500.0                  # simulate a 5% drawdown in the broker's own equity
+broker4.day_start_equity = 9500.0      # keep the (unrelated) daily-loss check from also firing
+risk4 = RiskEngine(cfg, bus, state, audit, circuit_breaker=cb3)
+orch8 = RuleOrchestrator(bus, state, audit, risk4, broker4, FakeProvider(),
+                         circuit_breaker=cb3)
+orch8._regime_gate = lambda symbol: {"regime": "Bull",
+                                     "policy": REGIME_POLICY["Bull"]}
+orch8.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 10,
+    "why": "test circuit breaker sizing", "urgency": "🟢 ACTIONABLE",
+    "mode": "ENTRY", "gates": "5/5"}
+orch8.step(["CBSIZE"], risk_pct=1.0)
+check("step(): a 5% drawdown roughly halves the executed order size",
+      "CBSIZE" in broker4.positions and broker4.positions["CBSIZE"]["qty"] == 5)
+
+# ---- 36. P7b: transaction cost model — spread estimate + square-root impact
+_rng11 = np.random.default_rng(4)
+_n11 = 100
+_close11 = 100 * np.exp(np.cumsum(_rng11.normal(0.0005, 0.01, _n11)))
+_vol11 = np.full(_n11, 500000.0)
+_idx11 = pd.bdate_range("2024-01-01", periods=_n11)
+_df_wide = pd.DataFrame({"Open": _close11, "High": _close11 * 1.02,
+                        "Low": _close11 * 0.98, "Close": _close11,
+                        "Volume": _vol11}, index=_idx11)
+_df_tight = pd.DataFrame({"Open": _close11, "High": _close11 * 1.002,
+                         "Low": _close11 * 0.998, "Close": _close11,
+                         "Volume": _vol11}, index=_idx11)
+check("transaction_costs: wider daily ranges estimate a bigger spread",
+      corwin_schultz_spread(_df_wide) > corwin_schultz_spread(_df_tight))
+_cost_small = expected_trade_cost(_df_tight, order_shares=100,
+                                  price=float(_close11[-1]))
+_cost_big = expected_trade_cost(_df_tight, order_shares=200000,
+                                price=float(_close11[-1]))
+check("transaction_costs: a much bigger order costs more (sqrt market impact)",
+      _cost_big["expected_cost_pct"] > _cost_small["expected_cost_pct"])
+
+# ---- 37. P7b: RiskEngine gates BUY entries on edge < 2x expected cost
+risk5 = RiskEngine(cfg, bus, state, audit)
+low_edge = risk5.review(Order("EDGETEST", "BUY", 5, reason="test"), broker, 100.0,
+                        cost_info={"expected_cost_pct": 1.0, "expected_edge_pct": 1.5})
+check("risk: vetoes a BUY when expected edge < 2x expected cost",
+      not low_edge.approved and "expected edge" in low_edge.veto_reason)
+good_edge = risk5.review(Order("EDGETEST2", "BUY", 5, reason="test"), broker, 100.0,
+                         cost_info={"expected_cost_pct": 1.0, "expected_edge_pct": 3.0})
+check("risk: approves a BUY when expected edge >= 2x expected cost",
+      good_edge.approved)
+
+# ---- 38. P7b: RuleOrchestrator.step() shows expected cost on every proposal
+orch9 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider())
+orch9._regime_gate = lambda symbol: {"regime": "Bull",
+                                     "policy": REGIME_POLICY["Bull"]}
+orch9.correlation_monitor = lambda: {"policy": CORRELATION_POLICY["normal"]}
+orch9.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 5,
+    "why": "test cost display", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY",
+    "gates": "5/5"}
+orch9.step(["P7BCOST"], risk_pct=1.0)
+propose_recs = [r for r in audit.tail(30) if r["action"] == "PROPOSE BUY"
+               and r.get("trigger") == "signals.P7BCOST"]
+check("step(): PROPOSE BUY audit record shows expected cost",
+      len(propose_recs) == 1 and "expected cost" in propose_recs[0]["reasoning"])
+
+# ---- 39. P7c: regime_gate — Bull/Bear/Storm mapping from the P2 HMM
+_rng12 = np.random.default_rng(6)
+_bull12 = _rng12.normal(0.0015, 0.006, 150)
+_bear12 = _rng12.normal(-0.0015, 0.006, 150)
+_storm12 = _rng12.normal(0.0, 0.04, 100)
+_r_storm_ending = pd.Series(np.concatenate([_bull12, _bear12, _storm12]))
+_rc = classify_regime(_r_storm_ending)
+check("regime_gate: the highest-vol state is labeled Storm regardless of its mean",
+      _rc["regime"] == "Storm"
+      and _rc["state_labels"][_rc["hmm"]["state_vols_pct"].index(
+          max(_rc["hmm"]["state_vols_pct"]))] == "Storm")
+check("regime_gate: Storm policy blocks new trades and tightens stops",
+      not REGIME_POLICY["Storm"]["new_trades_allowed"]
+      and REGIME_POLICY["Storm"]["tighten_stops"])
+check("regime_gate: Bear policy is dip-only at half size",
+      REGIME_POLICY["Bear"]["dip_only"]
+      and REGIME_POLICY["Bear"]["size_multiplier"] == 0.5)
+
+# ---- 40. P7c: StrategyRegistry tracks settled-signal performance per regime
+reg2 = StrategyRegistry(audit, path="runtime/_test/registry_p7c.json")
+reg2.log_signal("s3", "AAA", "BUY", 100.0, horizon_days=10, regime="Bull")
+reg2.log_signal("s3", "BBB", "BUY", 100.0, horizon_days=10, regime="Bear")
+for sgl in reg2._data["s3"]["signals"]:
+    sgl["ts"] = time.time() - 11 * 86400
+reg2.settle_signals("s3", price_lookup=lambda sym: 110.0 if sym == "AAA" else 95.0)
+perf = reg2.performance_by_regime("s3")
+check("strategy_registry: performance_by_regime splits settled signals by regime",
+      perf["Bull"]["n"] == 1 and perf["Bull"]["mean_return_%"] == 10.0
+      and perf["Bear"]["n"] == 1 and perf["Bear"]["mean_return_%"] == -5.0)
+
+# ---- 41. P7c: RuleOrchestrator.step() enforces the regime gate
+orch10 = RuleOrchestrator(bus, state, audit, risk, broker, FakeProvider())
+orch10.correlation_monitor = lambda: {"policy": CORRELATION_POLICY["normal"]}
+orch10._regime_gate = lambda symbol: {"regime": "Storm",
+                                      "policy": REGIME_POLICY["Storm"]}
+orch10.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 5,
+    "why": "t", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY", "gates": "5/5"}
+orch10.step(["P7CSTORM"], risk_pct=1.0)
+check("step(): STORM regime blocks a new BUY entry entirely",
+      "P7CSTORM" not in broker.positions
+      and any(r["action"] == "SIGNAL LOGGED (STORM REGIME)"
+             for r in audit.tail(20)))
+
+orch10._regime_gate = lambda symbol: {"regime": "Bear",
+                                      "policy": REGIME_POLICY["Bear"]}
+orch10.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 10,
+    "why": "t", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY", "gates": "5/5"}
+orch10.step(["P7CBEARTREND"], risk_pct=1.0)
+check("step(): BEAR regime blocks a trend-entry BUY (dip-buys only)",
+      "P7CBEARTREND" not in broker.positions
+      and any(r["action"] == "SIGNAL LOGGED (BEAR REGIME)"
+             for r in audit.tail(20)))
+
+orch10.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 10,
+    "why": "t", "urgency": "🟡 FAST SETUP", "mode": "ENTRY", "gates": "4/5"}
+orch10.step(["P7CBEARDIP"], risk_pct=1.0)
+check("step(): BEAR regime allows a dip-setup BUY, sized to half",
+      "P7CBEARDIP" in broker.positions
+      and broker.positions["P7CBEARDIP"]["qty"] == 5)
+
+# ---- 42. P7d: PaperBroker fills record decision_price + signed slippage_pct
+broker5 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_p7d.json")
+buy_order = Order("P7D", "BUY", 10, reason="test"); buy_order.approved = True
+f_buy = broker5.execute(buy_order, 100.0)
+check("broker: BUY fill records decision_price and a positive (cost) slippage_pct",
+      f_buy["decision_price"] == 100.0 and f_buy["slippage_pct"] > 0)
+sell_order = Order("P7D", "SELL", 10, reason="test"); sell_order.approved = True
+f_sell = broker5.execute(sell_order, 100.0)
+check("broker: SELL fill also records a positive (cost) slippage_pct",
+      f_sell["decision_price"] == 100.0 and f_sell["slippage_pct"] > 0)
+
+# ---- 43. P7d: slippage_report — honest empty cases + real aggregation
+check("execution_quality: no fills yet is an honest error, not a fake report",
+      "error" in slippage_report([]))
+_old_fill = {**f_buy, "ts": time.time() - 30 * 86400}   # outside a 7d lookback
+check("execution_quality: fills outside the lookback window are excluded",
+      "error" in slippage_report([_old_fill], lookback_days=7))
+_rep = slippage_report([f_buy, f_sell], lookback_days=7)
+check("execution_quality: aggregates avg/worst slippage and cost drag",
+      _rep["n_fills"] == 2 and _rep["avg_slippage_pct"] > 0
+      and _rep["total_cost_drag_$"] > 0 and len(_rep["worst_fills"]) == 2)
+
+# ---- 44. P7d: RuleOrchestrator.execution_quality_report() wires state + audit
+orch11 = RuleOrchestrator(bus, state, audit, risk, broker5, FakeProvider())
+eqr1 = orch11.execution_quality_report(lookback_days=7)
+check("execution_quality_report: writes state.execution_quality + an audit record",
+      state.get("execution_quality") is not None
+      and any(r["action"] == "EXECUTION QUALITY REPORT" for r in audit.tail(20)))
+
+# ---- 45. P7f: correlation_monitor — rolling regime + early-warning trend
+_rng13 = np.random.default_rng(11)
+_n13 = 150
+_common = _rng13.normal(0, 0.01, _n13)
+_idx13 = pd.bdate_range("2024-01-01", periods=_n13)
+_indep_a, _indep_b = _rng13.normal(0, 0.01, _n13), _rng13.normal(0, 0.01, _n13)
+_a_conv, _b_conv = np.zeros(_n13), np.zeros(_n13)
+for _t in range(_n13):
+    _w = _t / _n13                            # ramps 0 -> 1: full convergence
+    _a_conv[_t] = _w * _common[_t] + (1 - _w) * _indep_a[_t]
+    _b_conv[_t] = _w * _common[_t] + (1 - _w) * _indep_b[_t]
+_rets_converging = {"A": pd.Series(_a_conv, index=_idx13),
+                    "B": pd.Series(_b_conv, index=_idx13)}
+_cr_alert = correlation_regime(_rets_converging)
+check("correlation_monitor: full convergence trips the hard ALERT",
+      _cr_alert["alert"] and _cr_alert["current_avg_correlation"] > 0.7)
+
+_rets_flat = {"A": pd.Series(_rng13.normal(0, 0.01, _n13), index=_idx13),
+             "B": pd.Series(_rng13.normal(0, 0.01, _n13), index=_idx13)}
+check("correlation_monitor: independent series stay in the normal state",
+      correlation_regime(_rets_flat)["state"] == "normal")
+
+# ---- 46. P7f: RuleOrchestrator.correlation_monitor() wiring
+# a FRESH broker (0 positions) -- the shared `broker` has accumulated many
+# positions from earlier tests in this file by now.
+broker6 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_p7f.json")
+orch12 = RuleOrchestrator(bus, state, audit, risk, broker6, FakeProvider())
+check("correlation_monitor(): fewer than 2 positions -> normal policy, no error",
+      orch12.correlation_monitor()["policy"] == CORRELATION_POLICY["normal"])
+
+# ---- 47. P7f: step() blocks new entries on a correlation ALERT
+orch12._regime_gate = lambda symbol: {"regime": "Bull",
+                                      "policy": REGIME_POLICY["Bull"]}
+orch12.correlation_monitor = lambda: {"state": "alert", "alert": True,
+                                      "policy": CORRELATION_POLICY["alert"]}
+orch12.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 5,
+    "why": "t", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY", "gates": "5/5"}
+orch12.step(["P7FALERT"], risk_pct=1.0)
+check("step(): a correlation regime ALERT blocks a new BUY entry",
+      "P7FALERT" not in broker6.positions
+      and any(r["action"] == "SIGNAL LOGGED (CORRELATION ALERT)"
+             for r in audit.tail(20)))
+
+# ---- 48. P7g: portfolio_stress — correlated MC sim + risk budget feed
+_rng14 = np.random.default_rng(3)
+_n14 = 300
+_idx14 = pd.bdate_range("2024-01-01", periods=_n14)
+_common14 = _rng14.normal(0.0003, 0.015, _n14)
+_a14 = _common14 + _rng14.normal(0, 0.003, _n14)
+_b14 = _common14 + _rng14.normal(0, 0.003, _n14)      # highly correlated with A
+_c14 = _rng14.normal(0.0003, 0.015, _n14)             # independent of A
+
+_rets_corr14 = {"A": pd.Series(_a14, index=_idx14), "B": pd.Series(_b14, index=_idx14)}
+_rets_div14 = {"A": pd.Series(_a14, index=_idx14), "C": pd.Series(_c14, index=_idx14)}
+_dollars14 = {"A": 5000.0, "B": 5000.0}
+_dollars_div14 = {"A": 5000.0, "C": 5000.0}
+
+_stress_corr = simulate_portfolio(_rets_corr14, _dollars14, horizon_days=21,
+                                  n_paths=5000)
+_stress_div = simulate_portfolio(_rets_div14, _dollars_div14, horizon_days=21,
+                                 n_paths=5000)
+check("portfolio_stress: a correlated book shows higher P(10% DD) than a "
+      "diversified one with the same dollar exposure",
+      _stress_corr["p_10pct_drawdown_%"] > _stress_div["p_10pct_drawdown_%"])
+
+_bad_book = simulate_portfolio(
+    {"A": pd.Series(_rng14.normal(-0.001, 0.035, _n14), index=_idx14)},
+    {"A": 10000.0}, horizon_days=21, n_paths=5000)
+check("portfolio_stress: risk_budget_from_stress cuts size on elevated risk",
+      risk_budget_from_stress(_bad_book)["elevated_risk"]
+      and risk_budget_from_stress(_bad_book)["size_multiplier"] == 0.5)
+check("portfolio_stress: risk_budget_from_stress stays normal otherwise",
+      not risk_budget_from_stress(_stress_div)["elevated_risk"])
+
+# ---- 49. P7g: RuleOrchestrator.stress_test() wiring + step() risk-budget feed
+broker7 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_p7g.json")
+orch13 = RuleOrchestrator(bus, state, audit, risk, broker7, FakeProvider())
+check("stress_test(): honest error with no open positions",
+      "error" in orch13.stress_test())
+
+broker7.positions["P7GPOS"] = {"qty": 10, "avg_price": 100.0}
+st_out = orch13.stress_test(horizon_days=21, n_paths=2000)
+check("stress_test(): writes state.portfolio_stress + an audit record",
+      "error" not in st_out and state.get("portfolio_stress") is not None
+      and any(r["action"] == "PORTFOLIO STRESS TEST" for r in audit.tail(20)))
+
+state.set("portfolio_stress.risk_budget",
+         {"size_multiplier": 0.5, "elevated_risk": True})
+orch13._regime_gate = lambda symbol: {"regime": "Bull",
+                                      "policy": REGIME_POLICY["Bull"]}
+orch13.correlation_monitor = lambda: {"policy": CORRELATION_POLICY["normal"]}
+orch13.analyze = lambda symbol, **kw: {
+    "symbol": symbol, "signal": "BUY", "price": 100.0, "shares": 10,
+    "why": "t", "urgency": "🟢 ACTIONABLE", "mode": "ENTRY", "gates": "5/5"}
+orch13.step(["P7GSIZE"], risk_pct=1.0)
+check("step(): a cached elevated stress-test risk budget halves new-entry size",
+      "P7GSIZE" in broker7.positions and broker7.positions["P7GSIZE"]["qty"] == 5)
+
+# ---- 50. P7h: daily_report — markdown rendering, honest empty states
+_empty_report = render_report({
+    "date": "2026-07-20", "equity": 10000.0, "day_start_equity": 10000.0,
+    "pnl_today_$": 0.0, "pnl_today_pct": 0.0, "fills_today": [],
+    "risk_limits": {}, "signals_today": {"n": 0, "buy": 0, "sell": 0},
+    "settled_today": {"n": 0, "win_rate_pct": 0.0, "mean_return_pct": 0.0},
+    "settled_cumulative": None, "suggestions": [], "notes": ["test note"]})
+check("daily_report: renders all four required sections",
+      all(h in _empty_report for h in ("## P&L Attribution",
+                                       "## Risk Limit Utilization",
+                                       "## Signal Quality",
+                                       "## Tomorrow's Candidate Orders")))
+check("daily_report: honest empty states, not fabricated numbers",
+      "_No fills today._" in _empty_report
+      and "_No tradeable candidates ranked" in _empty_report)
+
+_filled_report = render_report({
+    "date": "2026-07-20", "equity": 10500.0, "day_start_equity": 10000.0,
+    "pnl_today_$": 500.0, "pnl_today_pct": 5.0,
+    "fills_today": [{"ticker": "AAA", "side": "BUY", "qty": 10,
+                     "price": 100.0, "realized": 0.0, "strategy": "rule_v1"}],
+    "risk_limits": {"Gross exposure": {"used": "$1,000", "cap": "$12,000",
+                                       "pct": 8.3}},
+    "signals_today": {"n": 2, "buy": 1, "sell": 1},
+    "settled_today": {"n": 3, "win_rate_pct": 66.7, "mean_return_pct": 1.2},
+    "settled_cumulative": {"n": 40, "win_rate_pct": 55.0, "mean_return_pct": 0.8},
+    "suggestions": [{"ticker": "BBB", "verdict": "LONG", "target_score": 72.0,
+                     "entry": 50.0, "stop": 47.0, "target": 56.0,
+                     "reasons_pro": ["strong momentum"]}],
+    "notes": []})
+check("daily_report: real fills/signals/suggestions render into the tables",
+      "AAA" in _filled_report and "BBB" in _filled_report
+      and "66.7" in _filled_report)
+
+# ---- 51. P7h: RuleOrchestrator.daily_report() wiring — file, state, audit
+broker8 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_p7h.json")
+reg8 = StrategyRegistry(audit, path="runtime/_test/registry_p7h.json")
+orch14 = RuleOrchestrator(bus, state, audit, risk, broker8, FakeProvider(),
+                          registry=reg8)
+rep = orch14.daily_report(watchlist=None, reports_dir="runtime/_test/reports")
+check("daily_report(): writes a real markdown file to the reports dir",
+      os.path.exists(rep["path"]) and rep["path"].endswith(".md"))
+check("daily_report(): writes state.daily_report + a DAILY REPORT audit record",
+      state.get("daily_report") is not None
+      and any(r["action"] == "DAILY REPORT" for r in audit.tail(20)))
+
+# ---- 52. P8: market_status — session boundaries in ET, weekday-only
+_ET = ZoneInfo("America/New_York")
+check("market_status: 10:00 ET Tuesday is Market Open",
+      market_status(datetime(2026, 7, 21, 10, 0, tzinfo=_ET))["session"] == "open")
+check("market_status: 8:00 ET Tuesday is Pre-Market",
+      market_status(datetime(2026, 7, 21, 8, 0, tzinfo=_ET))["session"] == "pre")
+check("market_status: 17:00 ET Tuesday is After-Hours",
+      market_status(datetime(2026, 7, 21, 17, 0, tzinfo=_ET))["session"] == "after")
+check("market_status: 2:00 ET Tuesday is Closed",
+      market_status(datetime(2026, 7, 21, 2, 0, tzinfo=_ET))["session"] == "closed")
+check("market_status: Saturday is Closed regardless of time",
+      market_status(datetime(2026, 7, 25, 10, 0, tzinfo=_ET))["session"] == "closed")
+
+# ---- 53. P8: filter_price_outliers — drops a High/Low ratio spike
+_rng15 = np.random.default_rng(21)
+_n15 = 60
+_close15 = 100 + np.cumsum(_rng15.normal(0, 0.5, _n15))
+_high15, _low15 = _close15 * 1.01, _close15 * 0.99
+_high15[40] = _close15[40] * 5.0              # injected spike: H/L blows out
+_df15 = pd.DataFrame({"Open": _close15, "High": _high15, "Low": _low15,
+                     "Close": _close15, "Volume": 1e6},
+                     index=pd.bdate_range("2024-01-01", periods=_n15))
+_filtered15 = filter_price_outliers(_df15)
+check("filter_price_outliers: drops the injected High/Low ratio spike",
+      _df15.index[40] not in _filtered15.index)
+check("filter_price_outliers: leaves every normal bar untouched",
+      len(_filtered15) == _n15 - 1)
+
+# ---- 54. P8: LSEProvider.get_candles trims to the requested lookback
+# even though the vault's /candles endpoint itself only supports
+# limit+order (no start/end filter) -- this was the AAPL-back-to-2008
+# chart bug: a "2y" request silently returned ~5000 bars of raw history.
+def _fake_get_wide(path, params):
+    if path == "/candles":
+        idx15 = pd.bdate_range(end=pd.Timestamp.now(), periods=3000)
+        return [{"timestamp": int(ts.timestamp()), "open": 100.0,
+                 "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000}
+                for ts in idx15]
+    return None
+
+lse5 = LSEProvider(api_key="dummy-key-for-test")
+lse5._get = _fake_get_wide
+_wide = lse5.get_candles("AAPL", interval="1d", lookback="2y")
+check("lse: get_candles trims a 3000-bar vault response down to ~2y",
+      len(_wide) < 3000
+      and (pd.Timestamp.now() - _wide.index.min()).days <= 731)
+
+# ---- 55. P8: PollingFeed — market_hours_gate pauses network calls when closed
+import data.providers as _providers_mod
+_orig_market_status = _providers_mod.market_status
+_providers_mod.market_status = lambda: {"session": "closed", "label": "Closed",
+                                        "et_time": None}
+feed2 = PollingFeed(bus, state, FakeProvider(), ["ZZZFEED"], interval_s=1,
+                    market_hours_gate=True)
+n_before2 = len(bus.recent(200, "tick"))
+feed2.start()
+time.sleep(1.5)
+feed2.stop()
+n_after2 = len(bus.recent(200, "tick"))
+_providers_mod.market_status = _orig_market_status
+check("feed: market_hours_gate pauses network calls entirely when closed",
+      n_after2 == n_before2)
+
+# ---- 56. P8: PollingFeed — repeated empty fetches trip the throttle backoff
+class _EmptyProvider(FakeProvider):
+    def get_quote(self, symbol):
+        return {}
+
+feed3 = PollingFeed(bus, state, _EmptyProvider(), ["THROTTLESYM"], interval_s=1,
+                    market_hours_gate=False)
+feed3.start()
+time.sleep(2.5)
+feed3.stop()
+check("feed: repeated empty fetches set feed.throttled for a 2min backoff",
+      state.get("feed.throttled") is not None
+      and state.get("feed.throttled")["retry_at"] > time.time())
+
+# ---- 56b. P9: CompositeProvider.get_quotes_batch needs a YahooProvider
+comp_no_yahoo = CompositeProvider([FakeProvider()], state)
+check("composite: get_quotes_batch returns empty without a YahooProvider "
+      "in the chain (no per-symbol fallback loop -- that would defeat "
+      "the point of batching)",
+      comp_no_yahoo.get_quotes_batch(["AAPL"]) == {})
+
+# ---- 56c. P9: PollingFeed priority tier fetches positions/watchlist
+# symbols every tick even when they're outside the universe list
+feed4 = PollingFeed(bus, state, FakeProvider(), ["UNIVA", "UNIVB", "UNIVC"],
+                    interval_s=1, market_hours_gate=False,
+                    priority_fn=lambda: ["PRIORITYSYM"])
+feed4.start()
+time.sleep(1.5)
+feed4.stop()
+check("feed: priority_fn symbols get quotes every tick regardless of "
+      "the universe batch cadence",
+      state.get("quotes.PRIORITYSYM") is not None)
+
+# ---- 56d. P9: PollingFeed scans the universe in batches via
+# get_quotes_batch (one chunk per tick), not one get_quote() per symbol
+class _BatchProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.batch_calls = []
+    def get_quotes_batch(self, symbols):
+        self.batch_calls.append(list(symbols))
+        return {s: {"symbol": s, "price": 1.0, "chg_pct": 0.0}
+               for s in symbols}
+
+bp = _BatchProvider()
+universe5 = [f"U{i}" for i in range(5)]      # batch_size=2 -> 3 batches
+feed5 = PollingFeed(bus, state, bp, universe5, interval_s=1,
+                    market_hours_gate=False, batch_size=2)
+feed5.start()
+time.sleep(2.5)                              # ~3 ticks -> exactly one pass
+feed5.stop()
+check("feed: universe scan calls get_quotes_batch in <=batch_size chunks",
+      len(bp.batch_calls) >= 3 and all(len(c) <= 2 for c in bp.batch_calls))
+prog = state.get("feed.universe_scan_progress")
+check("feed: universe_scan_progress reaches the full total after one pass",
+      prog is not None and prog["total"] == 5 and prog["scanned"] == 5)
+
+# ---- 57. P8: sector_scan rate-limited to once per 5 minutes
+_scan5_again = orch5.sector_scan(["P5A", "P5B"], account=10000, risk_pct=1.0)
+check("sector_scan: immediate repeat call is throttled, returns cached result",
+      _scan5_again.get("throttled") is True
+      and _scan5_again.get("sectors") == state.get("sector_scan")["sectors"])
+
+# ---- 58. P8: LSEProvider.options_chain rate-limited to once per 10 minutes
+_chain_calls = {"n": 0}
+def _fake_chain_get(path, params):
+    if path == "/options/chain":
+        _chain_calls["n"] += 1
+        return [{"strike": 100, "type": "call", "iv": 0.2}]
+    return None
+lse6 = LSEProvider(api_key="dummy-key-for-test")
+lse6._get = _fake_chain_get
+_c1 = lse6.options_chain("AAPL")
+_c2 = lse6.options_chain("AAPL")
+check("lse: options_chain caps the vault to one fetch per 10min per underlying",
+      _chain_calls["n"] == 1 and len(_c1) == 1 and len(_c2) == 1)
+
+# ---- 59. P8: RuleOrchestrator.morning_briefing() wiring
+broker9 = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_p8m.json")
+orch15 = RuleOrchestrator(bus, state, audit, risk, broker9, FakeProvider())
+mb = orch15.morning_briefing(watchlist=None, reports_dir="runtime/_test/reports")
+check("morning_briefing(): writes a real markdown file to the reports dir",
+      os.path.exists(mb["path"]) and mb["path"].endswith("_morning.md"))
+check("morning_briefing(): writes state.morning_briefing + an audit record",
+      state.get("morning_briefing") is not None
+      and any(r["action"] == "MORNING BRIEFING" for r in audit.tail(20)))
+
+# ---- 60. P8: TradingScheduler — job registration + market-hours gating
+from core.scheduler import TradingScheduler
+import core.scheduler as _sched_mod
+
+_sched_calls = {"n": 0}
+class _FakeOrchForSched:
+    def step(self, symbols, risk_pct=1.0, bypass_incubation=False, **kwargs):
+        _sched_calls["n"] += 1
+        return []
+    def daily_report(self, watchlist=None, scan_universe=None):
+        pass
+    def morning_briefing(self, watchlist=None, scan_universe=None):
+        pass
+
+sched = TradingScheduler(_FakeOrchForSched(), symbols_fn=lambda: ["AAPL"])
+check("scheduler: status() reports not running before start()",
+      sched.status() == {"running": False, "jobs": []})
+sched.start()
+st5 = sched.status()
+check("scheduler: start() registers all three jobs",
+      st5["running"] and {j["id"] for j in st5["jobs"]} ==
+      {"decision_cycle", "morning_briefing", "daily_report"})
+check("scheduler: next_run() returns a real datetime for a live job, "
+      "None for an unknown one",
+      sched.next_run("decision_cycle") is not None
+      and sched.next_run("nonexistent_job") is None)
+
+_orig_ms = _sched_mod.market_status
+_sched_mod.market_status = lambda: {"session": "closed"}
+sched._run_decision_cycle()
+check("scheduler: decision cycle no-ops outside market hours",
+      _sched_calls["n"] == 0)
+_sched_mod.market_status = lambda: {"session": "open"}
+sched._run_decision_cycle()
+check("scheduler: decision cycle runs when the market is open",
+      _sched_calls["n"] == 1)
+_sched_mod.market_status = _orig_ms
+sched.shutdown()
+check("scheduler: shutdown() stops cleanly",
+      sched.status()["running"] is False)
+
+# ---- 61. AuditLog reloads jsonl into memory (Streamlit Cloud restart)
+_reload_path = "runtime/_test/audit_reload.jsonl"
+os.makedirs("runtime/_test", exist_ok=True)
+with open(_reload_path, "w") as f:
+    f.write(json.dumps({"id": "r1", "ts": 1, "actor": "T", "action": "HELLO",
+                        "trigger": "", "model": "", "reasoning": "reloaded",
+                        "data": {}}) + "\n")
+audit_re = AuditLog(bus, path=_reload_path)
+check("audit: reloads existing jsonl into memory on init",
+      any(r["action"] == "HELLO" for r in audit_re.tail(5)))
+
+# ---- 62. Gist persistence: no token → local only; token → hydrate + PATCH
+from core.gist_store import GistStore, reset_gist_store, GIST_DESCRIPTION
+
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._payload = payload
+    def json(self):
+        return self._payload
+
+_gdir = "runtime/_test/gist_h"
+shutil.rmtree(_gdir, ignore_errors=True)
+os.makedirs(_gdir, exist_ok=True)
+
+_local_only = GistStore(token="", gist_id="", runtime_dir=_gdir)
+check("gist: disabled without GITHUB_TOKEN", not _local_only.enabled)
+check("gist: does not track files when disabled",
+      not _local_only.tracks(os.path.join(_gdir, "broker.json")))
+check("gist: last_saved_label is None without a token",
+      _local_only.last_saved_label() is None)
+
+# live store must refuse runtime/_test/ files even with a token
+_live = GistStore(token="tok", gist_id="x", runtime_dir="runtime")
+check("gist: live store never tracks runtime/_test isolation files",
+      not _live.tracks("runtime/_test/broker.json"))
+
+_http = {"get": [], "post": [], "patch": []}
+_broker_payload = json.dumps({
+    "cash": 42.0, "start_equity": 42.0, "day_start_equity": 42.0,
+    "positions": {"AAPL": {"qty": 3, "avg_price": 100.0}}, "fills": []})
+
+def _g_get(url, **kw):
+    _http["get"].append(url)
+    if url.endswith("/abc123"):
+        return _FakeResp(200, {
+            "id": "abc123", "description": GIST_DESCRIPTION,
+            "files": {"broker.json": {"content": _broker_payload},
+                      "audit.jsonl": {"content": ""}}})
+    return _FakeResp(200, [])
+
+def _g_post(url, **kw):
+    _http["post"].append(url)
+    return _FakeResp(201, {"id": "newid", "files": {}})
+
+def _g_patch(url, **kw):
+    _http["patch"].append(kw.get("json") or {})
+    return _FakeResp(200, {"id": "abc123"})
+
+_gs = GistStore(token="tok", gist_id="abc123", runtime_dir=_gdir,
+                http_get=_g_get, http_post=_g_post, http_patch=_g_patch)
+check("gist: hydrate restores broker.json from the gist",
+      _gs.hydrate() and os.path.exists(os.path.join(_gdir, "broker.json")))
+with open(os.path.join(_gdir, "broker.json")) as f:
+    _restored = json.load(f)
+check("gist: hydrated broker cash/positions match gist payload",
+      _restored["cash"] == 42.0 and "AAPL" in _restored["positions"])
+
+_gs.queue(os.path.join(_gdir, "broker.json"), immediate=True)
+check("gist: immediate queue PATCHes the gist and stamps last_saved_ts",
+      _gs.last_saved_ts is not None and len(_http["patch"]) == 1
+      and "broker.json" in _http["patch"][0]["files"])
+check("gist: last_saved_label mentions GitHub",
+      "Last saved to GitHub" in (_gs.last_saved_label() or ""))
+
+# PaperBroker._save with a test-dir path must NOT hit the process singleton
+reset_gist_store(GistStore(token="tok", gist_id="abc123", runtime_dir="runtime",
+                           http_get=_g_get, http_post=_g_post, http_patch=_g_patch))
+_pre_patches = len(_http["patch"])
+_b_g = PaperBroker(cfg, bus, state, audit, path="runtime/_test/broker_gist.json")
+o_g = Order("MSFT", "BUY", 1, reason="gist isolation"); o_g.approved = True
+_b_g.execute(o_g, 50.0)
+check("gist: PaperBroker save under runtime/_test does not PATCH the live gist",
+      len(_http["patch"]) == _pre_patches)
+reset_gist_store(_GistStore(token="", runtime_dir="runtime"))
+
+# ---- 61. Discount-zone filter + trailing stop (public swing rules)
+from quant.sm_zones import classify_zone, market_mode
+from quant.playbook import build_playbook
+
+def _swing_df(end_price: float, high: float = 200.0, low: float = 100.0):
+    """Daily bars: grind low→high then close at end_price."""
+    n = 80
+    up = np.linspace(low, high, n - 5)
+    tail = np.linspace(high, end_price, 5)
+    close = np.concatenate([up, tail])
+    idx = pd.bdate_range("2024-01-01", periods=len(close))
+    return pd.DataFrame(
+        {"Open": close, "High": close * 1.01, "Low": close * 0.99,
+         "Close": close, "Volume": 1e6}, index=idx)
+
+_z_prem = classify_zone(_swing_df(198.0))
+check("zone: price at swing high is PREMIUM",
+      _z_prem["label"] == "PREMIUM" and _z_prem["in_premium"])
+_z_ote = classify_zone(_swing_df(130.0))  # 0.70 retrace of 100→200
+check("zone: 0.70 retrace sits in BUY_ZONE or DISCOUNT",
+      _z_ote["label"] in ("BUY_ZONE", "DISCOUNT") and _z_ote["in_discount"])
+_mm = market_mode(_swing_df(198.0))
+check("market_mode: returns a known regime label",
+      _mm["mode"] in ("EXPANSION", "COMPRESSION", "CAPITULATION", "UNKNOWN"))
+
+_pb_off = build_playbook(_swing_df(198.0), require_discount=False)
+_pb_on = build_playbook(_swing_df(198.0), require_discount=True)
+check("playbook: require_discount does not crash on premium bars",
+      "urgency" in _pb_on and "zone" in _pb_on)
+check("playbook: premium + filter ON is not ACTIONABLE",
+      _pb_on["urgency"] != "🟢 ACTIONABLE")
+
+_b_trail = PaperBroker(cfg, bus, state, audit, path="runtime/_test/trail_broker.json")
+o_t = Order("TRAILT", "BUY", 5, reason="test", stop=90.0); o_t.approved = True
+_b_trail.execute(o_t, 100.0)
+check("broker: BUY stamps the initial stop on the position",
+      abs(_b_trail.positions["TRAILT"]["stop"] - 90.0) < 0.01)
+check("broker: update_stop ratchets up",
+      _b_trail.update_stop("TRAILT", 95.0)
+      and abs(_b_trail.positions["TRAILT"]["stop"] - 95.0) < 0.01)
+check("broker: update_stop refuses a lower stop",
+      _b_trail.update_stop("TRAILT", 80.0) is False
+      and abs(_b_trail.positions["TRAILT"]["stop"] - 95.0) < 0.01)
+
+from quant.setup_risk import size_setup as _size_setup
+_zone_bz = {"in_buy_zone": True, "label": "BUY_ZONE"}
+_zone_disc = {"in_buy_zone": False, "label": "DISCOUNT"}
+_full = _size_setup(urgency="🟢 ACTIONABLE", zone=_zone_bz, mode={"mode": "EXPANSION"},
+                    weekly={"weekly_osc": 20}, atr=2.0, price=100.0,
+                    account=10000.0, risk_cap_pct=3.0)
+_scalp = _size_setup(urgency="🟡 FAST SETUP", zone=_zone_disc, mode={"mode": "CAPITULATION"},
+                     weekly={"weekly_osc": 5}, atr=2.0, price=100.0,
+                     account=10000.0, risk_cap_pct=3.0)
+check("setup_risk: buy-zone swing uses more of the cap than a scalp",
+      _full["risk_pct"] > _scalp["risk_pct"] and _full["stop_atr"] > _scalp["stop_atr"])
+check("setup_risk: never exceeds the owner cap",
+      _full["risk_pct"] <= 3.0 + 1e-9)
+_bear = _size_setup(urgency="🟢 ACTIONABLE", zone=_zone_bz, mode={"mode": "EXPANSION"},
+                    weekly={"weekly_osc": 20}, atr=2.0, price=100.0,
+                    account=10000.0, risk_cap_pct=3.0,
+                    fundamental={"bearish_pct": 80})
+check("setup_risk: bearish news cuts size vs the same technicals",
+      _bear["risk_pct"] < _full["risk_pct"])
+
+from quant.setup_risk import (structure_stop as _struct_stop,
+                              book_overlap_mult as _book_ov,
+                              high_impact_soon as _hisoon,
+                              ticker_edge_from_comp as _tedge)
+_ss = _struct_stop(100.0, 2.0, {"ote_lo": 96.0, "swing_low": 90.0}, 2.5)
+check("structure_stop: uses the zone (not raw ATR) when it sits 1-4 ATR away",
+      _ss["kind"] == "structure" and 95.0 < _ss["stop"] < 97.0)
+_ss_far = _struct_stop(100.0, 2.0, {"ote_lo": 70.0, "swing_low": 70.0}, 2.5)
+check("structure_stop: caps a distant swing at 4 ATR",
+      _ss_far["kind"] == "structure-far→4ATR" and abs(_ss_far["stop"] - 92.0) < 0.05)
+
+_idx = pd.bdate_range("2024-01-01", periods=80)
+_px = pd.Series(np.linspace(100, 140, 80), index=_idx)
+_held_df = pd.DataFrame({"Open": _px, "High": _px*1.01, "Low": _px*0.99,
+                         "Close": _px, "Volume": 1e6}, index=_idx)
+_cand_df = _held_df.copy()
+_bm, _bn = _book_ov(_cand_df, {"HELD": _held_df})
+check("book_overlap: identical series is treated as crowded",
+      _bm <= 0.40 and "crowded" in _bn)
+
+check("high_impact_soon: FOMC inside 24h is flagged",
+      _hisoon({"upcoming_events": [
+          {"event": "FOMC Rate Decision",
+           "date": (pd.Timestamp.utcnow() + pd.Timedelta(hours=12)).isoformat()}
+      ]}) is True)
+check("high_impact_soon: boring event is ignored",
+      _hisoon({"upcoming_events": [
+          {"event": "Existing Home Sales",
+           "date": (pd.Timestamp.utcnow() + pd.Timedelta(hours=12)).isoformat()}
+      ]}) is False)
+
+_sig = pd.Series(["HOLD"] * 80)
+_sig.iloc[50] = "BUY"
+_comp_e = pd.DataFrame({"signal": _sig}, index=_idx)
+# price rips after the BUY → positive edge
+_close_up = pd.Series(np.concatenate([np.full(51, 100.0), np.linspace(100, 120, 29)]),
+                      index=_idx)
+# not enough BUY samples (1) → mult 1.0
+check("ticker_edge: too few BUY samples is a no-op (mult 1.0)",
+      _tedge(_comp_e, _close_up)["mult"] == 1.0)
+
+_desk = orch.refresh_desk(universe=["TREND"], chart_symbol="TREND",
+                          account=10000, risk_pct=1.0)
+check("refresh_desk: returns a stamp and writes desk.last_refresh",
+      isinstance(_desk, dict) and state.get("desk.last_refresh") is not None)
+
+from quant.scorecard import book_heat as _bheat, trade_stats as _tstats, vs_benchmark as _vb
+check("scorecard: empty fills are honest zeros, not fake edge",
+      _tstats([])["n_exits"] == 0 and _tstats([])["win_rate"] is None)
+check("scorecard: excess vs SPY is book minus benchmark",
+      _vb(5.0, 2.0)["excess_pct"] == 3.0)
+_bh = PaperBroker(cfg, bus, state, audit, path="runtime/_test/heat_broker.json")
+_oh = Order("HEAT", "BUY", 20, reason="wide stop", stop=50.0)
+_oh = risk.review(_oh, _bh, 100.0)
+check("risk: vetoes a ticket that would push book heat over 6%",
+      (not _oh.approved) and "heat" in (_oh.veto_reason or "").lower())
+_os = Order("SLIPX", "BUY", 2, reason="custom slip", slippage=0.01)
+_os.approved = True
+_fs = _bh.execute(_os, 100.0)
+check("broker: order.slippage overrides the 5bp default",
+      _fs and abs(_fs["price"] - 101.0) < 0.02)
+
+from quant.desk_read import attribution as _attr, robustness as _rob
+_comp_a = pd.DataFrame({
+    "trend": [0.8], "momentum": [0.6], "bxtrender": [0.4],
+    "macd": [0.2], "rsi": [-0.1], "meanrev": [0.0], "volume": [0.3],
+    "score": [0.4], "signal": ["BUY"],
+})
+_aa = _attr(_comp_a)
+check("desk_read: BUY with 5 models long is BROAD and trend-led",
+      _aa["crowd"] == "BROAD" and _aa["leader"] == "trend" and _aa["n_long"] >= 5)
+_wf_bad = pd.DataFrame({"Sharpe": [-0.4, 0.1, -0.2, -0.5],
+                        "CAGR %": [1, 2, 0, -1],
+                        "Buy&Hold CAGR %": [8, 8, 8, 8]})
+_rb = _rob(_wf_bad, {"CAGR %": 2.0, "Buy&Hold CAGR %": 12.0})
+check("desk_read: last-fold death is FRAGILE",
+      _rb["label"] == "FRAGILE")
+check("desk_read: strategy losing to buy-hold is called out",
+      _rb["activity"] is not None and "Activity lost" in _rb["activity"])
+_wf_good = pd.DataFrame({"Sharpe": [0.8, 0.6, 0.5, 0.7]})
+check("desk_read: most folds green is ROBUST",
+      _rob(_wf_good, {"CAGR %": 15.0, "Buy&Hold CAGR %": 10.0})["label"] == "ROBUST")
+
+print("\n" + "=" * 44)
+passed = sum(1 for _, ok in results if ok)
+print(f"QUANTTRADER CORE: {passed}/{len(results)} PASS")
+sys.exit(0 if passed == len(results) else 1)
